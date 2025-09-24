@@ -1,0 +1,22 @@
+name = "legal-mcp"
+version = "0.1.0"
+description = "Legal MCP tool-use environment for Verifiers (wraps external MCP tools and adds judge+cost rewards)"
+tags = ["tool-use", "multi-turn", "legal", "mcp", "train"]
+requires-python = ">=3.11,<3.13"
+
+[project]
+name = "legal-mcp"
+version = "0.1.0"
+description = "Legal MCP tool-use environment for Verifiers (wraps external MCP tools and adds judge+cost rewards)"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "verifiers[all]>=0.1.3.post0",
+]
+
+[tool.hatch.build]
+include = ["legal_mcp.py", "README.md"]
+
+[tool.uv.sources]
+verifiers = { git = "https://github.com/willccbb/verifiers.git" }
+
