@@ -10,6 +10,7 @@ import datasets
 import numpy as np
 import torch
 import wandb
+import os
 from accelerate.utils import broadcast_object_list, gather_object, is_peft_model
 from peft import PeftConfig, get_peft_model
 from torch.utils.data import DataLoader, Sampler
@@ -535,9 +536,15 @@ class GRPOTrainer(Trainer):
         self.vllm_client = VLLMClient(
             host=host, port=port, connection_timeout=args.vllm_server_timeout
         )
-        # Only initialize communicator on the main process
+        # Allow disabling vLLM sync via env for stability/OOM workarounds
+        self.disable_vllm_sync = os.getenv("DISABLE_VLLM_SYNC") == "1"
+        if self.disable_vllm_sync and self.accelerator.is_main_process:
+            logging.warning(
+                "DISABLE_VLLM_SYNC=1 detected; skipping vLLM weight synchronization."
+            )
+        # Only initialize communicator on the main process when syncing is enabled
         # Other processes will only use the client for non-NCCL operations
-        if self.accelerator.is_main_process:
+        if not self.disable_vllm_sync and self.accelerator.is_main_process:
             self.vllm_client.init_communicator()
 
         self._last_loaded_step = (
@@ -951,7 +958,10 @@ class GRPOTrainer(Trainer):
         # Check if we need to generate new completions
         if self._step % generate_every == 0 or self._buffered_inputs is None:
             # Update weights to vLLM if needed
-            if self.state.global_step > self._last_loaded_step:
+            if (
+                not self.disable_vllm_sync
+                and self.state.global_step > self._last_loaded_step
+            ):
                 self.logger.info(
                     f"Syncing weights to vLLM at step {self.state.global_step}"
                 )

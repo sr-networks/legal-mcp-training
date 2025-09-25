@@ -178,8 +178,14 @@ class VLLMClient(AsyncOpenAI):
         pg = StatelessProcessGroup.create(
             host=self.host, port=self.group_port, rank=self.rank, world_size=world_size
         )
-        # Use device 0 like the old code - this seems to work better for multi-GPU setups
-        device = 0
+        # Use the current CUDA device to match the training process placement.
+        # This ensures the NCCL communicator binds to the same GPU the trainer uses
+        # (e.g., CUDA_VISIBLE_DEVICES=1 -> current_device()==0 maps to physical GPU1).
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA is required for vLLM weight sync; no GPU detected."
+            )
+        device = torch.cuda.current_device()
         logger.info(
             f"Initializing PyNcclCommunicator on device {device}, rank {self.rank}, world_size {world_size}"
         )
