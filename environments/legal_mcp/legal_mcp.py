@@ -149,7 +149,16 @@ async def tool_call_penalty(completion: list[dict], **_kwargs) -> float:
 def _make_rubric(judge_model: str, token_penalty_weight: float, toolcall_penalty_weight: float, judge_api_key: Optional[str] = None, judge_base_url: Optional[str] = None) -> vf.Rubric:
     from openai import AsyncOpenAI
     judge_client = AsyncOpenAI(api_key=judge_api_key or os.getenv("OPENAI_API_KEY", "dummy"), base_url=judge_base_url or os.getenv("JUDGE_BASE_URL", None))
-    judge = vf.JudgeRubric(parser=vf.Parser(), judge_client=judge_client, judge_model=judge_model, judge_sampling_args={"max_tokens": 64})
+    judge = vf.JudgeRubric(parser=vf.ThinkParser(), judge_client=judge_client, judge_model=judge_model, judge_sampling_args={"max_tokens": 64})
+    async def judge_accuracy_reward(judge, prompt, completion, answer, state, **kwargs) -> float:
+        judge_response = await judge(prompt, completion, answer, state, **kwargs)
+        if not isinstance(judge_response, str):
+            return 0.0
+        normalized = judge_response.strip().lower()
+        if isinstance(state, dict):
+            state["_judge_response"] = judge_response.strip()
+        return 1.0 if normalized.startswith("yes") else 0.0
+    judge.add_reward_func(judge_accuracy_reward, weight=1.0)
     costs = vf.Rubric(funcs=[token_penalty, tool_call_penalty], weights=[token_penalty_weight, toolcall_penalty_weight])
     return vf.RubricGroup([judge, costs])
 
@@ -201,13 +210,14 @@ def load_environment(
         ds = Dataset.from_list([
             {"prompt": [{"role": "user", "content": "Frage: Beispiel"}], "answer": ""}
         ])
-
     rubric = _make_rubric(judge_model, token_penalty_weight, toolcall_penalty_weight, judge_api_key=judge_api_key, judge_base_url=judge_base_url)
     tools = [elasticsearch_search, read_file_range, file_search] if enable_tools else []
+    parser = vf.ThinkParser()
     env = vf.ToolEnv(
         dataset=ds,
         rubric=rubric,
         tools=tools,
         max_turns=max_turns,
+        parser=parser
     )
     return env

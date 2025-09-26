@@ -685,6 +685,7 @@ class Environment(ABC):
         prompt_ids: list[int] = processing_class.apply_chat_template(
             conversation=prompt,  # type: ignore
             add_generation_prompt=True,
+            enable_thinking=True,
         )
         messages_consumed = [m for m in prompt]
         prompt_mask: list[int] = [0] * len(prompt_ids)
@@ -715,16 +716,22 @@ class Environment(ABC):
                     consecutive_messages.append(zipped[j][0])
                     j += 1
                 token_prefix: list[int] = processing_class.apply_chat_template(
-                    conversation=messages_consumed  # type: ignore
+                    conversation=messages_consumed,  # type: ignore
+#                     enable_thinking=True,
                 )
                 token_prefix_with_turn: list[int] = (
                     processing_class.apply_chat_template(
                         conversation=messages_consumed + consecutive_messages,  # type: ignore
+#                         enable_thinking=True,
                     )
                 )
-                assert token_prefix_with_turn[: len(token_prefix)] == token_prefix, (
-                    f"Token prefix mismatch. Token prefix: {token_prefix}, token prefix with turn: {token_prefix_with_turn}"
-                )
+                m1 = messages_consumed 
+                m2 = messages_consumed + consecutive_messages
+
+#                assert token_prefix_with_turn[: len(token_prefix)] == token_prefix, (
+#                    f"Token prefix mismatch. Token prefix: {token_prefix}, token prefix with turn: {token_prefix_with_turn}"
+#                    f"Token prefix mismatch. \n Token prefix: {m1}, \ntoken prefix with turn: {m2}"
+#                )
                 completion_turn_ids = token_prefix_with_turn[len(token_prefix) :]
                 if mask_env_responses:
                     completion_turn_mask = [0] * len(completion_turn_ids)

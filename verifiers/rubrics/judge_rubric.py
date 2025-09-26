@@ -76,6 +76,7 @@ class JudgeRubric(Rubric):
         judge_prompt = self.judge_prompt.format(
             question=question, answer=answer, response=response
         )
+        print ("\nRESPONSE:", response)
         cached = state.get("judge_response")
         if isinstance(cached, dict) and judge_prompt in cached:
             return cached[judge_prompt]

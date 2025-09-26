@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import wandb
 import os
+import re
 from accelerate.utils import broadcast_object_list, gather_object, is_peft_model
 from peft import PeftConfig, get_peft_model
 from torch.utils.data import DataLoader, Sampler
@@ -400,7 +401,8 @@ class GRPOTrainer(Trainer):
                 if isinstance(prompt, list):
                     # Chat format
                     prompt_text = processing_class.apply_chat_template(
-                        prompt, tokenize=False, add_generation_prompt=True
+                        prompt, tokenize=False, add_generation_prompt=True,
+#                        enable_thinking=True
                     )
                 else:
                     # Completion format
@@ -515,6 +517,9 @@ class GRPOTrainer(Trainer):
             "prompt": deque(maxlen=maxlen),
             "completion": deque(maxlen=maxlen),
             "rewards": defaultdict(lambda: deque(maxlen=maxlen)),
+            "answer": deque(maxlen=maxlen),
+            "judge_output": deque(maxlen=maxlen),
+            "thinking_trace": deque(maxlen=maxlen),
         }
 
         # OpenAI client for Environment generation (using vLLM server)
@@ -1062,6 +1067,8 @@ class GRPOTrainer(Trainer):
                     "all_reward_dict": batch_result.all_reward_dict,
                     "completions": batch_result.completions,
                     "prompts": batch_result.prompts,
+                    "answers": batch_result.answers,
+                    "judge_outputs": batch_result.judge_outputs,
                 }
             else:
                 broadcast_data = None
@@ -1136,6 +1143,8 @@ class GRPOTrainer(Trainer):
                     all_prompts=broadcast_data["prompts"],
                     all_completions=broadcast_data["completions"],
                     all_reward_dict=broadcast_data["all_reward_dict"],
+                    all_answers=broadcast_data.get("answers", []),
+                    all_judge_outputs=broadcast_data.get("judge_outputs", []),
                 )
 
                 # Log completion metrics using full batch data on CPU to save memory
@@ -1318,6 +1327,41 @@ class GRPOTrainer(Trainer):
                 msg.pop("tool_call_id")
         return completion
 
+    @staticmethod
+    def _flatten_message_content(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            pieces: list[str] = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    pieces.append(str(part.get("text", "")))
+            return "".join(pieces)
+        return ""
+
+    def _extract_thinking_trace(
+        self, completion: Union[str, List[Dict[str, Any]]]
+    ) -> str:
+        messages: List[Dict[str, Any]]
+        if isinstance(completion, str):
+            messages = [{"role": "assistant", "content": completion}]
+        else:
+            messages = [m for m in completion if isinstance(m, dict)]
+
+        thoughts: list[str] = []
+        for msg in messages:
+            if msg.get("role") != "assistant":
+                continue
+            text = self._flatten_message_content(msg.get("content")).strip()
+            if not text:
+                continue
+            matches = re.findall(r"<think>(.*?)</think>", text, flags=re.DOTALL)
+            for segment in matches:
+                cleaned = segment.strip()
+                if cleaned:
+                    thoughts.append(cleaned)
+        return "\n\n".join(thoughts)
+
     def evaluate(
         self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval", **kwargs
     ):
@@ -1391,6 +1435,7 @@ class GRPOTrainer(Trainer):
                     comp,  # type: ignore
                     tokenize=True,
                     add_generation_prompt=False,
+                    enable_thinking=True
                 )
                 # Tokenize and count
                 completion_lengths.append(len(tokens))
@@ -1429,6 +1474,17 @@ class GRPOTrainer(Trainer):
             ):
                 import pandas as pd
 
+                answers = list(eval_results.answer or [])
+                judge_states = eval_results.state[: self.num_completions_to_print]
+                judge_outputs = [
+                    (
+                        state.get("_judge_response")
+                        if isinstance(state, dict)
+                        else None
+                    )
+                    for state in judge_states
+                ]
+
                 table_data = {
                     "step": [str(self.state.global_step)] * len(prompts),
                     "prompt": prompts,
@@ -1436,11 +1492,25 @@ class GRPOTrainer(Trainer):
                         self._sanitize_tool_calls(c)  # type: ignore
                         for c in completions
                     ],
+                    "gold_answer": [
+                        answers[i] if i < len(answers) else ""
+                        for i in range(len(prompts))
+                    ],
+                    "judge_output": judge_outputs,
+                    "thinking_trace": [
+                        self._extract_thinking_trace(c) for c in completions
+                    ],
                 }
                 for k, v in reward_dict.items():
                     table_data[k] = v
 
                 df = pd.DataFrame(table_data)
+                if "gold_answer" in df:
+                    df["gold_answer"] = df["gold_answer"].fillna("")
+                if "judge_output" in df:
+                    df["judge_output"] = df["judge_output"].fillna("")
+                if "thinking_trace" in df:
+                    df["thinking_trace"] = df["thinking_trace"].fillna("")
                 wandb.log({"eval_completions": wandb.Table(dataframe=df)})
 
         # Log all metrics
@@ -1491,6 +1561,18 @@ class GRPOTrainer(Trainer):
                         self._sanitize_tool_calls(c)
                         for c in self._textual_logs["completion"]
                     ],
+                    "gold_answer": [
+                        (a if a is not None else "")
+                        for a in self._textual_logs["answer"]
+                    ],
+                    "judge_output": [
+                        (j if j is not None else "")
+                        for j in self._textual_logs["judge_output"]
+                    ],
+                    "thinking_trace": [
+                        (t if t is not None else "")
+                        for t in self._textual_logs["thinking_trace"]
+                    ],
                     **{k: list(v) for k, v in self._textual_logs["rewards"].items()},
                 }
                 if len(table["prompt"]) > 0:
@@ -1502,6 +1584,9 @@ class GRPOTrainer(Trainer):
             # Clear the textual logs after logging
             self._textual_logs["prompt"].clear()
             self._textual_logs["completion"].clear()
+            self._textual_logs["answer"].clear()
+            self._textual_logs["judge_output"].clear()
+            self._textual_logs["thinking_trace"].clear()
             for key in self._textual_logs["rewards"]:
                 self._textual_logs["rewards"][key].clear()
 
@@ -1540,6 +1625,8 @@ class GRPOTrainer(Trainer):
         all_prompts: List[Union[str, List[Dict[str, Any]]]],
         all_completions: List[Union[str, List[Dict[str, Any]]]],
         all_reward_dict: Dict[str, Any],
+        all_answers: List[Any],
+        all_judge_outputs: List[Any],
     ) -> None:
         """
         Log textual data for wandb (PRIMARY PROCESS ONLY).
@@ -1547,6 +1634,25 @@ class GRPOTrainer(Trainer):
         """
         self._textual_logs["prompt"].extend(all_prompts)
         self._textual_logs["completion"].extend(all_completions)
+        num_entries = len(all_completions)
+
+        answer_values = list(all_answers) if all_answers else [""] * num_entries
+        if len(answer_values) < num_entries:
+            answer_values.extend([""] * (num_entries - len(answer_values)))
+
+        judge_values = (
+            list(all_judge_outputs)
+            if all_judge_outputs
+            else [None] * num_entries
+        )
+        if len(judge_values) < num_entries:
+            judge_values.extend([None] * (num_entries - len(judge_values)))
+
+        self._textual_logs["answer"].extend(answer_values)
+        self._textual_logs["judge_output"].extend(judge_values)
+        self._textual_logs["thinking_trace"].extend(
+            [self._extract_thinking_trace(c) for c in all_completions]
+        )
 
         # Log all reward scores - both individual functions and consolidated
         for reward_key in all_reward_dict:

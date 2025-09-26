@@ -38,6 +38,8 @@ class BatchResult(BaseModel):
         default_factory=list
     )  # Store completions for logging
     prompts: list[Any] = Field(default_factory=list)  # Store prompts for logging
+    answers: list[Any] = Field(default_factory=list)
+    judge_outputs: list[Any] = Field(default_factory=list)
 
 
 class AsyncBatchGenerator:
@@ -300,6 +302,11 @@ class AsyncBatchGenerator:
             all_reward_dict=all_reward_dict,
             completions=env_results.completion,
             prompts=env_results.prompt,
+            answers=list(env_results.answer or []),
+            judge_outputs=[
+                state.get("_judge_response") if isinstance(state, dict) else None
+                for state in env_results.state
+            ],
         )
 
     async def _evaluate_async(self, num_samples: int = -1) -> GenerateOutputs:

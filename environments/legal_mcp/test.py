@@ -106,12 +106,13 @@ import asyncio
 # Policy model served by vLLM (OpenAI-compatible server)
 vllm_base_url = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1")
 vllm_api_key = os.getenv("VLLM_API_KEY", "EMPTY")  # vLLM often ignores auth; keep placeholder
-policy_model = os.getenv("POLICY_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
+policy_model = os.getenv("POLICY_MODEL", "Qwen/Qwen3-4B-Thinking-2507")
 
 # Preflight: ensure policy endpoint is reachable and model is served
 policy_client = AsyncOpenAI(base_url=vllm_base_url, api_key=vllm_api_key)
 
-model_name = "Qwen/Qwen3-4B-Instruct-2507"
+model_name = "Qwen/Qwen3-4B-Thinking-2507"
+#model_name = "Qwen/Qwen3-8B"
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 model_kwargs = {
   "torch_dtype": torch.bfloat16 if device.type == "cuda" else torch.float32,
@@ -141,9 +142,9 @@ args = GRPOConfig(
   num_iterations=1,
   # Use a smaller context window by default to reduce VRAM
   max_seq_len=4096,
-  per_device_train_batch_size=8,
+  per_device_train_batch_size=4,
   num_generations=8,
-  gradient_accumulation_steps=1,
+  gradient_accumulation_steps=2,
   gradient_checkpointing=True,
   save_strategy="steps",
   save_steps=5,
