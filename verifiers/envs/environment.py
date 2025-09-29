@@ -717,12 +717,12 @@ class Environment(ABC):
                     j += 1
                 token_prefix: list[int] = processing_class.apply_chat_template(
                     conversation=messages_consumed,  # type: ignore
-#                     enable_thinking=True,
+                     enable_thinking=True,
                 )
                 token_prefix_with_turn: list[int] = (
                     processing_class.apply_chat_template(
                         conversation=messages_consumed + consecutive_messages,  # type: ignore
-#                         enable_thinking=True,
+                        enable_thinking=True,
                     )
                 )
                 m1 = messages_consumed 

@@ -8,6 +8,43 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+
+def _extract_usage_from_response(response: Any) -> tuple[int, int]:
+    usage = getattr(response, "usage", None)
+    if usage is None and isinstance(response, dict):
+        usage = response.get("usage")
+    if usage is None:
+        return 0, 0
+
+    def _get(attr: str) -> int:
+        val = getattr(usage, attr, None)
+        if val is None and isinstance(usage, dict):
+            val = usage.get(attr, 0)
+        return int(val or 0)
+
+    return _get("prompt_tokens"), _get("completion_tokens")
+
+
+def _extract_token_usage(state: dict[str, Any]) -> dict[str, Any]:
+    per_turn: list[dict[str, int]] = []
+    total_prompt = 0
+    total_completion = 0
+    for response in state.get("responses", []):
+        prompt_tokens, completion_tokens = _extract_usage_from_response(response)
+        per_turn.append(
+            {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+            }
+        )
+        total_prompt += prompt_tokens
+        total_completion += completion_tokens
+    return {
+        "per_turn": per_turn,
+        "total_prompt_tokens": total_prompt,
+        "total_completion_tokens": total_completion,
+    }
+
 from verifiers import GenerateOutputs
 from verifiers.types import ProcessedOutputs
 
@@ -40,6 +77,8 @@ class BatchResult(BaseModel):
     prompts: list[Any] = Field(default_factory=list)  # Store prompts for logging
     answers: list[Any] = Field(default_factory=list)
     judge_outputs: list[Any] = Field(default_factory=list)
+    token_usage: list[Any] = Field(default_factory=list)
+    turn_counts: list[int] = Field(default_factory=list)
 
 
 class AsyncBatchGenerator:
@@ -305,6 +344,14 @@ class AsyncBatchGenerator:
             answers=list(env_results.answer or []),
             judge_outputs=[
                 state.get("_judge_response") if isinstance(state, dict) else None
+                for state in env_results.state
+            ],
+            turn_counts=[
+                state.get("turn", 0) if isinstance(state, dict) else 0
+                for state in env_results.state
+            ],
+            token_usage=[
+                _extract_token_usage(state) if isinstance(state, dict) else {}
                 for state in env_results.state
             ],
         )

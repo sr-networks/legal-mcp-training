@@ -107,6 +107,7 @@ class MultiTurnEnv(Environment):
                 rollout += response_text
                 completion += response_text
             state["turn"] += 1
+            print ("  -------------------turns  ",state["turn"])
             if await maybe_await(self.is_completed, rollout, state, **kwargs) or (
                 state["turn"] >= self.max_turns and self.max_turns > 0
             ):

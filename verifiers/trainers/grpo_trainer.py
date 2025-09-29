@@ -5,7 +5,7 @@ import time
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Sized, Tuple, Union
-
+import json
 import datasets
 import numpy as np
 import torch
@@ -402,7 +402,7 @@ class GRPOTrainer(Trainer):
                     # Chat format
                     prompt_text = processing_class.apply_chat_template(
                         prompt, tokenize=False, add_generation_prompt=True,
-#                        enable_thinking=True
+                        enable_thinking=True
                     )
                 else:
                     # Completion format
@@ -520,6 +520,10 @@ class GRPOTrainer(Trainer):
             "answer": deque(maxlen=maxlen),
             "judge_output": deque(maxlen=maxlen),
             "thinking_trace": deque(maxlen=maxlen),
+            "turn_count": deque(maxlen=maxlen),
+            "token_summary": deque(maxlen=maxlen),
+            "tool_outputs": deque(maxlen=maxlen),
+            "conversation_text": deque(maxlen=maxlen),
         }
 
         # OpenAI client for Environment generation (using vLLM server)
@@ -1069,6 +1073,8 @@ class GRPOTrainer(Trainer):
                     "prompts": batch_result.prompts,
                     "answers": batch_result.answers,
                     "judge_outputs": batch_result.judge_outputs,
+                    "turn_counts": batch_result.turn_counts,
+                    "token_usage": batch_result.token_usage,
                 }
             else:
                 broadcast_data = None
@@ -1145,6 +1151,12 @@ class GRPOTrainer(Trainer):
                     all_reward_dict=broadcast_data["all_reward_dict"],
                     all_answers=broadcast_data.get("answers", []),
                     all_judge_outputs=broadcast_data.get("judge_outputs", []),
+                    all_turn_counts=broadcast_data.get("turn_counts", []),
+                    all_token_usage=broadcast_data.get("token_usage", []),
+                    all_tool_outputs=[
+                        self._extract_tool_outputs(comp)
+                        for comp in broadcast_data["completions"]
+                    ],
                 )
 
                 # Log completion metrics using full batch data on CPU to save memory
@@ -1339,14 +1351,89 @@ class GRPOTrainer(Trainer):
             return "".join(pieces)
         return ""
 
+    @staticmethod
+    def _extract_assistant_messages(
+        completion: Union[str, List[Dict[str, Any]]]
+    ) -> List[Dict[str, Any]]:
+        if isinstance(completion, str):
+            return [{"role": "assistant", "content": completion}]
+        return [
+            msg for msg in completion if isinstance(msg, dict) and msg.get("role") == "assistant"
+        ]
+
+    @staticmethod
+    def _summarize_token_usage_from_state(state: Any) -> Dict[str, Any]:
+        if not isinstance(state, dict):
+            return {}
+        per_turn: list[Dict[str, int]] = []
+        total_prompt = 0
+        total_completion = 0
+
+        def _get_usage(response: Any, key: str) -> int:
+            usage = getattr(response, "usage", None)
+            if usage is None and isinstance(response, dict):
+                usage = response.get("usage")
+            if usage is None:
+                return 0
+            value = getattr(usage, key, None)
+            if value is None and isinstance(usage, dict):
+                value = usage.get(key, 0)
+            return int(value or 0)
+
+        for response in state.get("responses", []):
+            prompt_tokens = _get_usage(response, "prompt_tokens")
+            completion_tokens = _get_usage(response, "completion_tokens")
+            per_turn.append(
+                {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                }
+            )
+            total_prompt += prompt_tokens
+            total_completion += completion_tokens
+
+        return {
+            "per_turn": per_turn,
+            "total_prompt_tokens": total_prompt,
+            "total_completion_tokens": total_completion,
+        }
+
+    @staticmethod
+    def _extract_tool_outputs(
+        completion: Union[str, List[Dict[str, Any]]]
+    ) -> str:
+        if isinstance(completion, str):
+            return ""
+        outputs: list[str] = []
+        for msg in completion:
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") != "tool":
+                continue
+            tool_id = msg.get("tool_call_id") or msg.get("name")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                text_parts: list[str] = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_parts.append(str(part.get("text", "")))
+                content = "".join(text_parts)
+            if not isinstance(content, str):
+                try:
+                    content = json.dumps(content, ensure_ascii=False)
+                except TypeError:
+                    content = str(content)
+            prefix = f"tool[{tool_id}]" if tool_id else "tool"
+            outputs.append(f"{prefix}: {content}")
+        return "\n".join(outputs)
+
     def _extract_thinking_trace(
         self, completion: Union[str, List[Dict[str, Any]]]
     ) -> str:
         messages: List[Dict[str, Any]]
-        if isinstance(completion, str):
-            messages = [{"role": "assistant", "content": completion}]
-        else:
-            messages = [m for m in completion if isinstance(m, dict)]
+        messages = [
+            m for m in self._extract_assistant_messages(completion) if isinstance(m, dict)
+        ]
 
         thoughts: list[str] = []
         for msg in messages:
@@ -1355,7 +1442,7 @@ class GRPOTrainer(Trainer):
             text = self._flatten_message_content(msg.get("content")).strip()
             if not text:
                 continue
-            matches = re.findall(r"<think>(.*?)</think>", text, flags=re.DOTALL)
+            matches = re.findall(r"(.*?)</think>", text, flags=re.DOTALL)
             for segment in matches:
                 cleaned = segment.strip()
                 if cleaned:
@@ -1395,6 +1482,16 @@ class GRPOTrainer(Trainer):
         rewards = torch.tensor(eval_results.reward)
         metrics["eval_reward"] = rewards.mean().item()
         metrics["eval_reward_std"] = rewards.std().item()
+
+        # Turn statistics: number of assistant turns in each rollout
+        if eval_results.state:
+            eval_turns = [
+                state.get("turn", 0) if isinstance(state, dict) else 0
+                for state in eval_results.state
+            ]
+            turn_tensor = torch.tensor(eval_turns)
+            metrics["eval_turns/mean"] = turn_tensor.float().mean().item()
+            metrics["eval_turns/max"] = turn_tensor.max().item()
 
         # Log individual reward function scores
         non_reward_metric_keys = [
@@ -1444,11 +1541,31 @@ class GRPOTrainer(Trainer):
         metrics["eval_completions/min_length"] = int(np.min(completion_lengths))
         metrics["eval_completions/max_length"] = int(np.max(completion_lengths))
 
+        eval_token_usage = [
+            self._summarize_token_usage_from_state(state)
+            for state in eval_results.state
+        ]
+        if eval_token_usage:
+            prompt_totals = [
+                summary.get("total_prompt_tokens", 0) for summary in eval_token_usage
+            ]
+            completion_totals = [
+                summary.get("total_completion_tokens", 0)
+                for summary in eval_token_usage
+            ]
+            metrics["eval_tokens/mean_prompt"] = float(np.mean(prompt_totals))
+            metrics["eval_tokens/max_prompt"] = float(np.max(prompt_totals))
+            metrics["eval_tokens/mean_completion"] = float(
+                np.mean(completion_totals)
+            )
+            metrics["eval_tokens/max_completion"] = float(np.max(completion_totals))
+
         # Log sample completions if requested
         if self.accelerator.is_main_process and self.log_completions:
             # Prepare textual logs
             prompts = eval_results.prompt[: self.num_completions_to_print]
             completions = eval_results.completion[: self.num_completions_to_print]
+            token_usage_samples = eval_token_usage[: self.num_completions_to_print]
 
             # Extract rewards for logging
             reward_dict = {}
@@ -1475,14 +1592,26 @@ class GRPOTrainer(Trainer):
                 import pandas as pd
 
                 answers = list(eval_results.answer or [])
-                judge_states = eval_results.state[: self.num_completions_to_print]
+                sample_states = eval_results.state[: self.num_completions_to_print]
                 judge_outputs = [
                     (
                         state.get("_judge_response")
                         if isinstance(state, dict)
                         else None
                     )
-                    for state in judge_states
+                    for state in sample_states
+                ]
+                turn_counts = [
+                    state.get("turn", 0) if isinstance(state, dict) else 0
+                    for state in sample_states
+                ]
+                total_prompt_tokens = [
+                    summary.get("total_prompt_tokens", 0)
+                    for summary in token_usage_samples
+                ]
+                total_completion_tokens = [
+                    summary.get("total_completion_tokens", 0)
+                    for summary in token_usage_samples
                 ]
 
                 table_data = {
@@ -1497,6 +1626,13 @@ class GRPOTrainer(Trainer):
                         for i in range(len(prompts))
                     ],
                     "judge_output": judge_outputs,
+                    "turn_count": turn_counts,
+                    "total_prompt_tokens": total_prompt_tokens,
+                    "total_completion_tokens": total_completion_tokens,
+                    "tool_outputs": tool_outputs_samples,
+                    "conversation_text": [
+                        self._flatten_conversation(c) for c in completions
+                    ],
                     "thinking_trace": [
                         self._extract_thinking_trace(c) for c in completions
                     ],
@@ -1509,6 +1645,20 @@ class GRPOTrainer(Trainer):
                     df["gold_answer"] = df["gold_answer"].fillna("")
                 if "judge_output" in df:
                     df["judge_output"] = df["judge_output"].fillna("")
+                if "turn_count" in df:
+                    df["turn_count"] = df["turn_count"].fillna(0).astype(int)
+                if "total_prompt_tokens" in df:
+                    df["total_prompt_tokens"] = (
+                        df["total_prompt_tokens"].fillna(0).astype(int)
+                    )
+                if "total_completion_tokens" in df:
+                    df["total_completion_tokens"] = (
+                        df["total_completion_tokens"].fillna(0).astype(int)
+                    )
+                if "tool_outputs" in df:
+                    df["tool_outputs"] = df["tool_outputs"].fillna("")
+                if "conversation_text" in df:
+                    df["conversation_text"] = df["conversation_text"].fillna("")
                 if "thinking_trace" in df:
                     df["thinking_trace"] = df["thinking_trace"].fillna("")
                 wandb.log({"eval_completions": wandb.Table(dataframe=df)})
@@ -1573,12 +1723,39 @@ class GRPOTrainer(Trainer):
                         (t if t is not None else "")
                         for t in self._textual_logs["thinking_trace"]
                     ],
+                    "turn_count": list(self._textual_logs["turn_count"]),
+                    "total_prompt_tokens": [
+                        summary.get("total_prompt_tokens", 0)
+                        if isinstance(summary, dict)
+                        else 0
+                        for summary in self._textual_logs["token_summary"]
+                    ],
+                    "total_completion_tokens": [
+                        summary.get("total_completion_tokens", 0)
+                        if isinstance(summary, dict)
+                        else 0
+                        for summary in self._textual_logs["token_summary"]
+                    ],
+                    "tool_outputs": list(self._textual_logs["tool_outputs"]),
+                    "conversation_text": list(self._textual_logs["conversation_text"]),
                     **{k: list(v) for k, v in self._textual_logs["rewards"].items()},
                 }
                 if len(table["prompt"]) > 0:
                     df = pd.DataFrame(table)
                     if self.wandb_log_unique_prompts:
                         df = df.drop_duplicates(subset=["prompt"])
+                    if "total_prompt_tokens" in df:
+                        df["total_prompt_tokens"] = (
+                            df["total_prompt_tokens"].fillna(0).astype(int)
+                        )
+                    if "total_completion_tokens" in df:
+                        df["total_completion_tokens"] = (
+                            df["total_completion_tokens"].fillna(0).astype(int)
+                        )
+                    if "tool_outputs" in df:
+                        df["tool_outputs"] = df["tool_outputs"].fillna("")
+                    if "conversation_text" in df:
+                        df["conversation_text"] = df["conversation_text"].fillna("")
                     wandb.log({"completions": wandb.Table(dataframe=df)})
 
             # Clear the textual logs after logging
@@ -1587,6 +1764,10 @@ class GRPOTrainer(Trainer):
             self._textual_logs["answer"].clear()
             self._textual_logs["judge_output"].clear()
             self._textual_logs["thinking_trace"].clear()
+            self._textual_logs["turn_count"].clear()
+            self._textual_logs["token_summary"].clear()
+            self._textual_logs["tool_outputs"].clear()
+            self._textual_logs["conversation_text"].clear()
             for key in self._textual_logs["rewards"]:
                 self._textual_logs["rewards"][key].clear()
 
@@ -1627,6 +1808,9 @@ class GRPOTrainer(Trainer):
         all_reward_dict: Dict[str, Any],
         all_answers: List[Any],
         all_judge_outputs: List[Any],
+        all_turn_counts: List[int],
+        all_token_usage: List[Any],
+        all_tool_outputs: List[str],
     ) -> None:
         """
         Log textual data for wandb (PRIMARY PROCESS ONLY).
@@ -1648,11 +1832,58 @@ class GRPOTrainer(Trainer):
         if len(judge_values) < num_entries:
             judge_values.extend([None] * (num_entries - len(judge_values)))
 
+        if all_turn_counts:
+            turn_values = list(all_turn_counts)
+        else:
+            turn_values = [len(self._extract_assistant_messages(c)) for c in all_completions]
+        if len(turn_values) < num_entries:
+            turn_values.extend([0] * (num_entries - len(turn_values)))
+
         self._textual_logs["answer"].extend(answer_values)
         self._textual_logs["judge_output"].extend(judge_values)
-        self._textual_logs["thinking_trace"].extend(
-            [self._extract_thinking_trace(c) for c in all_completions]
-        )
+        self._textual_logs["turn_count"].extend(turn_values)
+        thinking_traces = [self._extract_thinking_trace(c) for c in all_completions]
+        self._textual_logs["thinking_trace"].extend(thinking_traces)
+        token_summaries = [usage if isinstance(usage, dict) else {} for usage in all_token_usage] if all_token_usage else [{} for _ in range(num_entries)]
+        if len(token_summaries) < num_entries:
+            token_summaries.extend({} for _ in range(num_entries - len(token_summaries)))
+        self._textual_logs["token_summary"].extend(token_summaries)
+        tool_outputs = all_tool_outputs if all_tool_outputs else [
+            self._extract_tool_outputs(comp) for comp in all_completions
+        ]
+        if len(tool_outputs) < num_entries:
+            tool_outputs.extend("" for _ in range(num_entries - len(tool_outputs)))
+        self._textual_logs["tool_outputs"].extend(tool_outputs)
+        conversation_text = [
+            self._flatten_conversation(comp) for comp in all_completions
+        ]
+        self._textual_logs["conversation_text"].extend(conversation_text)
+
+        # Track turn statistics for scalar metrics
+        turn_tensor = torch.tensor(turn_values, device=self.accelerator.device)
+        mean_turns = turn_tensor.float().mean().item()
+        max_turns = turn_tensor.max().item()
+        self._metrics["train"]["turns/mean"].append(mean_turns)
+        self._metrics["train"]["turns/max"].append(float(max_turns))
+
+        # Log token statistics
+        for idx, summary in enumerate(token_summaries):
+            total_prompt = summary.get("total_prompt_tokens")
+            total_completion = summary.get("total_completion_tokens")
+            per_turn = summary.get("per_turn", [])
+            if total_prompt is None and total_completion is None:
+                continue
+            turn_str = ", ".join(
+                f"turn{turn_idx}:prompt={entry.get('prompt_tokens', 0)},completion={entry.get('completion_tokens', 0)}"
+                for turn_idx, entry in enumerate(per_turn)
+            )
+            self.logger.info(
+                "Trajectory %d token usage -> total_prompt=%s total_completion=%s %s",
+                idx,
+                total_prompt,
+                total_completion,
+                turn_str,
+            )
 
         # Log all reward scores - both individual functions and consolidated
         for reward_key in all_reward_dict:
@@ -1662,6 +1893,48 @@ class GRPOTrainer(Trainer):
                 if isinstance(reward_values, torch.Tensor)
                 else reward_values
             )
+        def _serialize_messages(messages: Union[str, List[Dict[str, Any]]]) -> Any:
+            if isinstance(messages, str):
+                return messages
+            serialized: list[dict[str, Any]] = []
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                cleaned = {
+                    "role": msg.get("role"),
+                    "content": msg.get("content"),
+                }
+                if "tool_call_id" in msg:
+                    cleaned["tool_call_id"] = msg["tool_call_id"]
+                if "tool_calls" in msg:
+                    calls = []
+                    for call in msg.get("tool_calls", []) or []:
+                        if isinstance(call, dict):
+                            func = call.get("function", {})
+                            calls.append(
+                                {
+                                    "id": call.get("id"),
+                                    "name": func.get("name"),
+                                    "arguments": func.get("arguments"),
+                                }
+                            )
+                        else:
+                            calls.append(str(call))
+                    cleaned["tool_calls"] = calls
+                serialized.append(cleaned)
+            return serialized
+
+        with open("trajectory.log", "a", encoding="utf-8") as fh:
+            for prompt, completion, flattened in zip(
+                all_prompts, all_completions, conversation_text
+            ):
+                payload = {
+                    "prompt": _serialize_messages(prompt),
+                    "completion": _serialize_messages(completion),
+                    "conversation_text": flattened,
+                }
+                fh.write(json.dumps(payload, ensure_ascii=False))
+                fh.write("\n")
 
     def _log_completion_metrics_primary(
         self,
@@ -1722,3 +1995,32 @@ class GRPOTrainer(Trainer):
         self._metrics[mode]["completions/max_terminated_length"].append(
             float(max(term_lengths))
         )
+    @staticmethod
+    def _flatten_conversation(
+        messages: Union[str, List[Dict[str, Any]]]
+    ) -> str:
+        if isinstance(messages, str):
+            return messages
+
+        parts: list[str] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role", "assistant")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                text_parts: list[str] = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_parts.append(str(part.get("text", "")))
+                content = "".join(text_parts)
+            if not isinstance(content, str):
+                content = json.dumps(content, ensure_ascii=False)
+
+            tool_info = ""
+            if role == "tool":
+                tool_id = msg.get("tool_call_id")
+                tool_info = f" [tool_call_id={tool_id}]" if tool_id else ""
+
+            parts.append(f"{role}{tool_info}: {content}")
+        return "\n".join(parts)

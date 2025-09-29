@@ -8,20 +8,23 @@ from verifiers.rubrics.rubric import Rubric
 from verifiers.types import Messages, State
 from verifiers.utils.async_utils import maybe_await
 
-DEFAULT_JUDGE_PROMPT = """Given a ground truth answer \
-and a response, determine if the response is correct.
+DEFAULT_JUDGE_PROMPT = """Gegeben sei eine ground truth Antwort \
+und eine Antwort zu einer komplexen juristischen Frage. \
+Bestimme ob die Antwort die Schlussfolgerung der ground truth Antwort korrekt \
+wiedergibt. Bewerte dabei auch, ob die juristischen Argumente dabei \
+so wie in der ground truth Antwort vorkommen.
 
-Question:
+Frage:
 ```
 {question}
 ```
 
-Ground truth answer:
+Ground truth Anwort:
 ```
 {answer}
 ```
 
-Response:
+Antwort:
 ```
 {response}
 ```

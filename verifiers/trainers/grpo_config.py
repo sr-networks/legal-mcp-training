@@ -59,7 +59,7 @@ class GRPOConfig(TrainingArguments):
         },
     )
     max_prompt_length: Optional[int] = field(
-        default=512,
+        default=16348,
         metadata={
             "help": "Maximum length of the prompt. If the prompt is longer than this value, it will be truncated left."
         },
@@ -281,7 +281,7 @@ class GRPOConfig(TrainingArguments):
         },
     )
     mask_truncated_completions: bool = field(
-        default=True,
+        default=False,
         metadata={
             "help": "When enabled, truncated completions are excluded from the loss calculation, preventing them from "
             "being incorrectly penalized and introducing noise during training. According to the DAPO paper, this is "

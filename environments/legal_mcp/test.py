@@ -9,6 +9,7 @@ import logging
 import os
 import csv
 import glob
+import random
 
 import torch
 from datasets import Dataset
@@ -83,6 +84,7 @@ for path in _discover_csvs():
         "answer": a,
       })
 
+random.shuffle(data)
 ds = Dataset.from_list(data)
 
 logging.getLogger("AsyncBatchGenerator").setLevel(logging.DEBUG)
@@ -90,9 +92,9 @@ logging.getLogger("AsyncBatchGenerator").addHandler(logging.StreamHandler())
 
 vf_env = load_environment(
   dataset=ds,
-  judge_model=os.getenv("JUDGE_MODEL", "gpt-4.1-nano"),
-  token_penalty_weight=-0.0005,
-  toolcall_penalty_weight=-0.1,
+  judge_model=os.getenv("JUDGE_MODEL", "gpt-5-nano-2025-08-07" ), #"gpt-5-nano-2025-08-07"  gpt-4.1-nano-2025-04-14
+  token_penalty_weight=0.0, #-0.000005,
+  toolcall_penalty_weight=0.0, # -0.01,
   legalgenius_path=os.getenv("LEGALGENIUS_PATH", "/disk/legalgenius"),
   judge_base_url=os.getenv("JUDGE_BASE_URL", "https://api.openai.com/v1"),
   judge_api_key=os.getenv("JUDGE_API_KEY", os.getenv("OPENAI_API_KEY")),
@@ -106,12 +108,12 @@ import asyncio
 # Policy model served by vLLM (OpenAI-compatible server)
 vllm_base_url = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1")
 vllm_api_key = os.getenv("VLLM_API_KEY", "EMPTY")  # vLLM often ignores auth; keep placeholder
-policy_model = os.getenv("POLICY_MODEL", "Qwen/Qwen3-4B-Thinking-2507")
+#policy_model = os.getenv("POLICY_MODEL", "willcb/Qwen3-4B")
 
 # Preflight: ensure policy endpoint is reachable and model is served
 policy_client = AsyncOpenAI(base_url=vllm_base_url, api_key=vllm_api_key)
 
-model_name = "Qwen/Qwen3-4B-Thinking-2507"
+model_name = "willcb/Qwen3-4B"
 #model_name = "Qwen/Qwen3-8B"
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 model_kwargs = {
@@ -131,20 +133,21 @@ model.to(device)
 args = GRPOConfig(
   output_dir="outputs/legal-mcp-grpo",
   run_name="legal-mcp-grpo",
-  learning_rate=1e-6,
+  learning_rate=1e-4,
   lr_scheduler_type="constant_with_warmup",
   warmup_steps=10,
-  max_steps=100,
+  max_steps=500,
   bf16=(device.type == "cuda"),
   fp16=False,
   no_cuda=(device.type != "cuda"),
   max_grad_norm=0.01,
   num_iterations=1,
   # Use a smaller context window by default to reduce VRAM
-  max_seq_len=4096,
-  per_device_train_batch_size=4,
+  max_seq_len=16348,    # prompt + multiple completions incl thoughts, tool results
+  max_tokens=16348,  # multiple thoughts and final results
+  per_device_train_batch_size=1,
   num_generations=8,
-  gradient_accumulation_steps=2,
+  gradient_accumulation_steps=8,
   gradient_checkpointing=True,
   save_strategy="steps",
   save_steps=5,

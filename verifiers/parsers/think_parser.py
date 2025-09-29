@@ -16,6 +16,7 @@ class ThinkParser(Parser):
             text = ""
         return self.extract_fn(text.strip())
 
+
     def get_format_reward_func(self) -> Callable:
         """
         Return a reward function that checks if each message follows the format:
