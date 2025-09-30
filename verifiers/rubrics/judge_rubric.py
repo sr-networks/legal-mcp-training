@@ -10,9 +10,14 @@ from verifiers.utils.async_utils import maybe_await
 
 DEFAULT_JUDGE_PROMPT = """Gegeben sei eine ground truth Antwort \
 und eine Antwort zu einer komplexen juristischen Frage. \
-Bestimme ob die Antwort die Schlussfolgerung der ground truth Antwort korrekt \
-wiedergibt. Bewerte dabei auch, ob die juristischen Argumente dabei \
+Bestimmen Sie, ob die Antwort die Schlussfolgerung der ground truth Antwort korrekt \
+wiedergibt. Bewerten Sie dabei auch, ob die juristischen Argumente dabei \
 so wie in der ground truth Antwort vorkommen.
+Ist der Sach- und Rechts­hintergrund ausreichend geklärt? Insbesondere:
+  - alle relevanten Normen (Gesetze/Verordnungen) in aktueller Fassung identifiziert,
+  - einschlägige Rechtsprechung (Leitentscheidungen, OLG/LSG/BSG/BGH/BVerfG etc.) gefunden,
+  - Unklarheiten  entweder durch Quellen geklärt oder als offene Punkte markiert.
+Wenn diese Punkte ausreichend beantwortet wurden, antworten Sie mit "yes", ansonsten mit "no".
 
 Frage:
 ```

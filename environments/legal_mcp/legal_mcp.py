@@ -70,7 +70,7 @@ def _require_dispatch() -> dict[str, Callable[..., Any]]:
 
 # --------- Tool wrappers (type hints + docstrings) ---------
 
-def elasticsearch_search(query: str, document_type: str = "all", max_results: int = 5, context_lines: int = 5) -> str:
+def elasticsearch_search(query: str, document_type: str = "all", max_results: int = 3, context_lines: int = 10) -> str:
     """Full-text search with relevance ranking over German legal corpus.
 
     Args:
@@ -96,7 +96,6 @@ def elasticsearch_search(query: str, document_type: str = "all", max_results: in
         if isinstance(entries, list):
             if len(entries) > max_results:
                 entries[:] = entries[:max_results]
-            print ("\n\nVOR DEM BEARBEITEN", entries)
             for entry in entries:
                 if not isinstance(entry, dict):
                     continue
@@ -128,7 +127,6 @@ def elasticsearch_search(query: str, document_type: str = "all", max_results: in
                     entry["line_matches"] = filtered_matches
                 if line_numbers:
                     entry["line_numbers"] = line_numbers
-        print ("\n\nNACH DEM BEARBEITEN", entries)
 
         return payload
 
@@ -153,13 +151,14 @@ def elasticsearch_search(query: str, document_type: str = "all", max_results: in
         return str(res)
 
 
-def read_file_range(path: str, line_number: Optional[int] = None, context_lines: int = 10, start: Optional[int] = None, end: Optional[int] = None) -> str:
+def read_file_range(path: str, line_number: Optional[int] = None, context_lines: int = 20, start: Optional[int] = None, end: Optional[int] = None) -> str:
     """Read a UTF-8 snippet by line-number (recommended) or byte-range.
 
     Provide (line_number[, context_lines]) for line-based mode, or (start,end) for byte-based mode.
     """
     d = _require_dispatch()
     res = d["read_file_range"](path=path, line_number=line_number, context_lines=context_lines, start=start, end=end)
+    print ("\n\nREAD_FILE_RSNGE",res)
     return res if isinstance(res, str) else json.dumps(res, ensure_ascii=False)
 
 
@@ -167,6 +166,7 @@ def file_search(query: str, glob: Optional[str] = None, max_results: int = 10) -
     """Return files whose contents match a boolean query (AND/OR, parentheses)."""
     d = _require_dispatch()
     res = d["file_search"](query=query, glob=glob, max_results=max_results)
+    print ("\n\n FILE SEARCH", res)
     return res if isinstance(res, str) else json.dumps(res, ensure_ascii=False)
 
 
@@ -270,7 +270,7 @@ def load_environment(
     judge_model: str = "gpt-4.1-nano",
     token_penalty_weight: float = 0.0, # -0.000005,
     toolcall_penalty_weight: float = 1.0, # -0.01,
-    max_turns: int = 4,
+    max_turns: int = 8,
     judge_base_url: Optional[str] = None,
     judge_api_key: Optional[str] = None,
     legalgenius_path: Optional[str] = None,
@@ -305,7 +305,7 @@ def load_environment(
             {"prompt": [{"role": "user", "content": "Frage: Beispiel"}], "answer": ""}
         ])
     rubric = _make_rubric(judge_model, token_penalty_weight, toolcall_penalty_weight, judge_api_key=judge_api_key, judge_base_url=judge_base_url)
-    tools = [elasticsearch_search, read_file_range, file_search] if enable_tools else []
+    tools = [read_file_range, elasticsearch_search ] if enable_tools else []
     parser = vf.ThinkParser()
     env = vf.ToolEnv(
         dataset=ds,
@@ -317,7 +317,7 @@ system_prompt = """\
 Sie sind ein juristischer Experte für deutsches Recht.
 
 ARBEITSSTIL
-- Denken Sie Schritt-für-Schritt im Kopf und geben Sie Ihr Reasoning in <think>...</think> aus.
+- Denken Sie Schritt-für-Schritt und geben Sie Ihr Reasoning in <think>...</think> aus.
 - Antworten Sie ausschließlich auf Deutsch, präzise und belegt.
 - Verwenden Sie KEIN internes/implizites Wissen für materielle Aussagen; recherchieren und belegen Sie alles mit Werkzeugen.
 
@@ -331,45 +331,30 @@ WERKZEUG-PFLICHT & ITERATION
 
 RECHERCHE-STRATEGIE
 - Beginnen Sie mit 2–4 variierenden Suchanfragen (Synonyme, Abkürzungen, §-Zitate).
-- Nutzen Sie `elasticsearch_search` zuerst (BEVORZUGT) für Schnellsuche und Relevanz-Ranking.
-- Öffnen Sie Treffer systematisch mit `read_file_range`, um Kontext (Randnummern/§-Überschriften/Leitsätze) zu prüfen.
-- Lassen Sie ZWINGEND mindestens eine Sequenz laufen: zuerst eine elasticsearch Suche und in einem zweiten turn DANACH einen read_file_range laufen, um konkrete Rückgaben aus den Daten zu erhalten.
-- Bei Bedarf grenzen Sie mit `file_search` (Dateinamen/Globs) ein.
-- Priorisieren Sie neuere Fassungen/Entscheidungen; nennen Sie Datum/ Fundstellen.
-- Prüfen Sie Widersprüche zwischen Quellen; begründen Sie Ihre Präferenz.
-
-PRÜF- & STOPPKRITERIEN (alle müssen erfüllt sein)
-1) Mindestens eine Primärquelle je Rechtsaussage (konkreter §/Abs./Satz od. amtliche Leitsätze).
-2) Alle Tatbestandsmerkmale identifiziert und gegen den (ggf. hypothetischen) Sachverhalt subsumiert.
-3) Relevante Ausnahmen, Fristen, Zuständigkeiten und Rechtsfolgen adressiert.
-4) Quellen ordentlich zitiert (Titel, §, Datum, optional Aktenzeichen, Dateipfad/Zeilenbereich).
-
-ANTWORTFORMAT
-1) <think>…</think>
-2) **Kurzantwort**: 2–4 Sätze, Kernaussage mit Ergebnis (Ja/Nein/Kommt darauf an + Konditionen).
-3) **Rechtsgrundlagen**: Liste mit §§ (vollständig zitiert) und maßgeblicher Rechtsprechung (Gericht, Datum, Az., Leitsatz kurz).
-4) **Subsumtion & Analyse**: Tatbestandsmerkmale → Anwendung auf Sachverhalt; abgewogene Argumente, Ausnahmen, Beweislast/Fristen.
-5) **Quellen**: strukturierte Auflistung mit Fundstellen und (falls verfügbar) Datei-/Zeilenbereichen.
+- Wenn Ergebnisse der Elasticsearch-Suche vorliegen: Überlegen Sie, welches Ergebnis (path + line number + text) zur Frage passt.
+- Öffnen Sie dann passende Treffer per line number mit dem Tool `read_file_range`, um den Kontext (+- n Zeilen um die line number) zu prüfen.
+- Bei Bedarf wiederholen Sie das elasticsearch bzw read_file_range Tool.
 
 Verfügbare Werkzeuge (Function/Tool Calling):
-1) elasticsearch_search (BEVORZUGT)
+1) elasticsearch_search
    Argumente: { query: string, document_type: 'all'|'gesetze'|'urteile', max_results: number, context_lines: number }
    Rückgabe: { total_hits: number,
-               matches: [{ title, document_type, file_path, score, content_preview, line_matches, metadata }] }
+               matches: [{ title, document_type, file_path, score, content_preview, line_matches with "context": {"line_number": line number, "text": context string } }]
    Zweck: Schnelle Volltextsuche im Rechtskorpus mit Relevanz-Ranking.
 
-2) read_file_range
-   Argumente: { path: string, line_number: number, context_lines: number }
+2) read_file_range (MUST RUN)
+   Argumente: { path: file_path string, line_number: line number from elasticsearch_search, context_lines: number }
    Rückgabe: { text: string }
    Zweck: Präzise Kontextpassagen (z. B. §-Überschriften, Leitsätze, Randnummern) zum Zitieren.
 
-3) file_search
-   Argumente: { query: string (mit AND/OR/Klammern), glob?: string, max_results?: number }
-   Rückgabe: { files: string[] }
-   Zweck: Dateinamen-/Pfad-basierte Eingrenzung.
-
 AUSFÜHRUNG
 - Denken Sie zuerst (<think>), dann rufen Sie die Tools in mehreren Schritten auf, bis die Prüfkriterien erfüllt sind.
-- Geben Sie anschließend die strukturierte Endantwort in Deutsch aus (siehe ANTWORTFORMAT).
-"""  )
+- Wiederholen Sie mindestens drei Zyklen von <think> und tool use inkl. real_file_range.
+- Geben Sie erst dann eine strukturierte Endantwort in Deutsch aus.
+""" 
+#3) file_search
+#   Argumente: { query: string (mit AND/OR/Klammern), glob?: string, max_results?: number }
+#   Rückgabe: { files: string[] }
+#   Zweck: Dateinamen-/Pfad-basierte Eingrenzung.
+ )
     return env

@@ -93,12 +93,12 @@ logging.getLogger("AsyncBatchGenerator").addHandler(logging.StreamHandler())
 vf_env = load_environment(
   dataset=ds,
   judge_model=os.getenv("JUDGE_MODEL", "gpt-5-nano-2025-08-07" ), #"gpt-5-nano-2025-08-07"  gpt-4.1-nano-2025-04-14
-  token_penalty_weight=0.0, #-0.000005,
-  toolcall_penalty_weight=0.0, # -0.01,
+  token_penalty_weight=0.0, #-0.000005,    # penalty when negative
+  toolcall_penalty_weight=1.0, # -0.01,     # penalty when negative
   legalgenius_path=os.getenv("LEGALGENIUS_PATH", "/disk/legalgenius"),
   judge_base_url=os.getenv("JUDGE_BASE_URL", "https://api.openai.com/v1"),
   judge_api_key=os.getenv("JUDGE_API_KEY", os.getenv("OPENAI_API_KEY")),
-  enable_tools=(os.getenv("DISABLE_TOOLS", "0").lower() not in {"1","true","yes"}),
+  enable_tools=True # (os.getenv("DISABLE_TOOLS", "0").lower() not in {"1","true","yes"}),
 )
 
 # Quick eval
@@ -113,7 +113,7 @@ vllm_api_key = os.getenv("VLLM_API_KEY", "EMPTY")  # vLLM often ignores auth; ke
 # Preflight: ensure policy endpoint is reachable and model is served
 policy_client = AsyncOpenAI(base_url=vllm_base_url, api_key=vllm_api_key)
 
-model_name = "willcb/Qwen3-4B"
+model_name = "willcb/Qwen3-8B"
 #model_name = "Qwen/Qwen3-8B"
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 model_kwargs = {
@@ -133,7 +133,7 @@ model.to(device)
 args = GRPOConfig(
   output_dir="outputs/legal-mcp-grpo",
   run_name="legal-mcp-grpo",
-  learning_rate=1e-4,
+  learning_rate=1e-6,
   lr_scheduler_type="constant_with_warmup",
   warmup_steps=10,
   max_steps=500,
@@ -143,6 +143,7 @@ args = GRPOConfig(
   max_grad_norm=0.01,
   num_iterations=1,
   # Use a smaller context window by default to reduce VRAM
+  max_prompt_length=1024,  # test because default=512
   max_seq_len=16348,    # prompt + multiple completions incl thoughts, tool results
   max_tokens=16348,  # multiple thoughts and final results
   per_device_train_batch_size=1,
