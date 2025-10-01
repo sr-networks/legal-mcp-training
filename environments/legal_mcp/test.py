@@ -15,7 +15,7 @@ import torch
 from datasets import Dataset
 from transformers import logging as hf_logging
 from transformers.utils import is_flash_attn_2_available
-
+from transformers import AutoTokenizer, AutoModelForImageTextToText
 from legal_mcp import load_environment
 from verifiers import GRPOTrainer, get_model_and_tokenizer, lora_defaults
 from verifiers.trainers import GRPOConfig
@@ -94,7 +94,7 @@ vf_env = load_environment(
   dataset=ds,
   judge_model=os.getenv("JUDGE_MODEL", "gpt-5-nano-2025-08-07" ), #"gpt-5-nano-2025-08-07"  gpt-4.1-nano-2025-04-14
   token_penalty_weight=0.0, #-0.000005,    # penalty when negative
-  toolcall_penalty_weight=1.0, # -0.01,     # penalty when negative
+  toolcall_penalty_weight=0.5, # -0.01,     # penalty when negative
   legalgenius_path=os.getenv("LEGALGENIUS_PATH", "/disk/legalgenius"),
   judge_base_url=os.getenv("JUDGE_BASE_URL", "https://api.openai.com/v1"),
   judge_api_key=os.getenv("JUDGE_API_KEY", os.getenv("OPENAI_API_KEY")),
@@ -113,6 +113,7 @@ vllm_api_key = os.getenv("VLLM_API_KEY", "EMPTY")  # vLLM often ignores auth; ke
 # Preflight: ensure policy endpoint is reachable and model is served
 policy_client = AsyncOpenAI(base_url=vllm_base_url, api_key=vllm_api_key)
 
+#model_name = "ServiceNow-AI/Apriel-1.5-15b-Thinker"
 model_name = "willcb/Qwen3-8B"
 #model_name = "Qwen/Qwen3-8B"
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -127,6 +128,13 @@ if device.type == "cpu":
 # require a GPU driver and will fail. This keeps CPU execution working.
 use_liger = (device.type == "cuda")
 model, tok = get_model_and_tokenizer(model_name, use_liger=use_liger, model_kwargs=model_kwargs)
+#model = AutoModelForImageTextToText.from_pretrained(
+#    model_name, 
+#    torch_dtype=torch.bfloat16, 
+#    device_map="auto"
+#)
+#tok = AutoTokenizer.from_pretrained(model_name)
+
 model.to(device)
 
 # Training config
@@ -196,6 +204,7 @@ if _msl:
 # Enable LoRA/PEFT to reduce trainable parameters and VRAM usage
 _lora_r = int(os.getenv("LORA_R", "16"))
 _lora_alpha = int(os.getenv("LORA_ALPHA", "64"))
+
 peft_cfg = lora_defaults(r=_lora_r, alpha=_lora_alpha)
 
 

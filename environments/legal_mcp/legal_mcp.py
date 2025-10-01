@@ -70,94 +70,52 @@ def _require_dispatch() -> dict[str, Callable[..., Any]]:
 
 # --------- Tool wrappers (type hints + docstrings) ---------
 
-def elasticsearch_search(query: str, document_type: str = "all", max_results: int = 3, context_lines: int = 10) -> str:
+def elasticsearch_search(query: str, document_type: str = "all", max_results: int = 3, context_lines: int = 3) -> str:
     """Full-text search with relevance ranking over German legal corpus.
 
     Args:
         query: Search terms or phrases (e.g., "Kündigungsfrist", "BGB § 573").
         document_type: One of {"all","gesetze","urteile"}.
-        max_results: Maximum number of results to return (3..50).
-        context_lines: Number of lines of context to include around matches (0..10).
+        max_results: Maximum number of results to return (3..10).
+        context_lines: Number of lines of context to include around matches (0..5).
     Returns:
-        JSON-serialized string with search results.
+        Raw JSON search result string.
     """
     d = _require_dispatch()
+    print(
+        "[legal_mcp] elasticsearch_search",
+        json.dumps(
+            {
+                "query": query,
+                "document_type": document_type,
+                "max_results": max_results,
+                "context_lines": context_lines,
+            },
+            ensure_ascii=False,
+        ),
+    )
     res = d["elasticsearch_search"](
         query=query,
         document_type=document_type,
         max_results=max_results,
         context_lines=context_lines,
     )
-
-    def _process_payload(payload: dict[str, Any]) -> dict[str, Any]:
-        # The backend may return either "matches" or "hits"; slice whichever is present.
-        key = "matches" if isinstance(payload.get("matches"), list) else "hits"
-        entries = payload.get(key)
-        if isinstance(entries, list):
-            if len(entries) > max_results:
-                entries[:] = entries[:max_results]
-            for entry in entries:
-                if not isinstance(entry, dict):
-                    continue
-                line_matches = entry.get("line_matches")
-                if not isinstance(line_matches, list):
-                    continue
-                filtered_matches: list[dict[str, Any]] = []
-                line_numbers: list[int] = []
-                for lm in line_matches:
-                    if not isinstance(lm, dict):
-                        continue
-                    context = lm.get("context")
-                    if isinstance(context, list):
-                        filtered_context = [
-                            ctx
-                            for ctx in context
-                            if isinstance(ctx, dict) and ctx.get("is_match")
-                        ]
-                        if not filtered_context:
-                            continue
-                        lm["context"] = filtered_context
-                    line_number = lm.get("line_number")
-                    if line_number is None:
-                        line_number = lm.get("match_line")
-                    if isinstance(line_number, int):
-                        line_numbers.append(line_number)
-                    filtered_matches.append(lm)
-                if filtered_matches:
-                    entry["line_matches"] = filtered_matches
-                if line_numbers:
-                    entry["line_numbers"] = line_numbers
-
-        return payload
-
     if isinstance(res, str):
-        try:
-            data = json.loads(res)
-        except json.JSONDecodeError:
-            return res
-        if isinstance(data, dict):
-            return json.dumps(_process_payload(data), ensure_ascii=False)
-        try:
-            return json.dumps(data, ensure_ascii=False)
-        except TypeError:
-            return str(data)
-
-    if isinstance(res, dict):
-        return json.dumps(_process_payload(res), ensure_ascii=False)
-    print ("ELASTICSEARHC",res)
+        return res
     try:
         return json.dumps(res, ensure_ascii=False)
     except TypeError:
         return str(res)
 
 
-def read_file_range(path: str, line_number: Optional[int] = None, context_lines: int = 20, start: Optional[int] = None, end: Optional[int] = None) -> str:
+def read_file_range(path: str, line_number: Optional[int] = None, context_lines: int = 20) -> str:
+#def read_file_range(path: str, line_number: Optional[int] = None, context_lines: int = 20, start: Optional[int] = None, end: Optional[int] = None) -> str:
     """Read a UTF-8 snippet by line-number (recommended) or byte-range.
 
     Provide (line_number[, context_lines]) for line-based mode, or (start,end) for byte-based mode.
     """
     d = _require_dispatch()
-    res = d["read_file_range"](path=path, line_number=line_number, context_lines=context_lines, start=start, end=end)
+    res = d["read_file_range"](path=path, line_number=line_number, context_lines=context_lines)
     print ("\n\nREAD_FILE_RSNGE",res)
     return res if isinstance(res, str) else json.dumps(res, ensure_ascii=False)
 
@@ -217,8 +175,8 @@ def _make_rubric(judge_model: str, token_penalty_weight: float, toolcall_penalty
     judge_client = AsyncOpenAI(api_key=judge_api_key or os.getenv("OPENAI_API_KEY", "dummy"), base_url=judge_base_url or os.getenv("JUDGE_BASE_URL", None))
     legal_judge_prompt="""Gegeben sei eine ground truth Antwort \
 und eine Antwort zu einer komplexen juristischen Frage. \
-Bestimme ob die Antwort die Schlussfolgerung der ground truth Antwort im Wesentlichen korrekt \
-wiedergibt. 
+Bewerte auf einer Skala von 1.0 (vollständig falsch) bis 10.0 (vollständig korrekt), \
+wie gut die Antwort die juristische Argumentation und Schlußfolgerung der ground truth Antwort wiedergibt. 
 
 Frage:
 ```
@@ -235,7 +193,7 @@ Antwort:
 {response}
 ```
 
-Respond either "yes" or "no" only."""
+Gib ausschließlich eine einzelne Fließkommazahl im Bereich 1.0 bis 10.0 zurück."""
 
     # parser is used for completion, ThinkParser when completion contains think xmls
     judge = vf.JudgeRubric(parser=vf.ThinkParser(), 
@@ -248,10 +206,18 @@ Respond either "yes" or "no" only."""
         print ("JUDGE:",judge_response)
         if not isinstance(judge_response, str):
             return 0.0
-        normalized = judge_response.strip().lower()
+        score_text = judge_response.strip()
         if isinstance(state, dict):
-            state["_judge_response"] = judge_response.strip()
-        return 1.0 if normalized.startswith("yes") else 0.0
+            state["_judge_response"] = score_text
+        try:
+            score = float(score_text.split()[0])
+        except (ValueError, IndexError):
+            return 0.0
+        if score < 1.0:
+            score = 1.0
+        elif score > 10.0:
+            score = 10.0
+        return float(score)
     judge.add_reward_func(judge_accuracy_reward, weight=1.0)
     costs = vf.Rubric(funcs=[token_penalty, tool_call_penalty], weights=[token_penalty_weight, toolcall_penalty_weight])
     return vf.RubricGroup([judge, costs])
@@ -339,7 +305,9 @@ Verfügbare Werkzeuge (Function/Tool Calling):
 1) elasticsearch_search
    Argumente: { query: string, document_type: 'all'|'gesetze'|'urteile', max_results: number, context_lines: number }
    Rückgabe: { total_hits: number,
-               matches: [{ title, document_type, file_path, score, content_preview, line_matches with "context": {"line_number": line number, "text": context string } }]
+               matches: [{ title, document_type, file_path, score,
+                            content_preview: [{"line_number": absolute line, "snippet": mehrzeiliger Kontext}],
+                            line_matches: ... }]
    Zweck: Schnelle Volltextsuche im Rechtskorpus mit Relevanz-Ranking.
 
 2) read_file_range (MUST RUN)

@@ -10,6 +10,7 @@ AGENTS.md
 .claude/
 .cursorrules
 .cursor/
+trajectory.log
 
 # artifacts
 core.* 
@@ -30,6 +31,7 @@ docs/build/
 # outputs
 wandb/
 /outputs/
+**/outputs/
 reports/
 logs/
 
@@ -46,7 +48,11 @@ verifiers/envs/multibranch_env.py
 wip/
 old/
 
+trajectory.log
+out.put
+
 # Incomplete environments
+environments/legal_mcp/*.csv
 environments/aime2024/
 environments/vf_acebench/
 environments/vf_bfcl_v3/
