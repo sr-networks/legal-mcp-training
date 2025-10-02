@@ -94,7 +94,7 @@ vf_env = load_environment(
   dataset=ds,
   judge_model=os.getenv("JUDGE_MODEL", "gpt-5-nano-2025-08-07" ), #"gpt-5-nano-2025-08-07"  gpt-4.1-nano-2025-04-14
   token_penalty_weight=0.0, #-0.000005,    # penalty when negative
-  toolcall_penalty_weight=0.5, # -0.01,     # penalty when negative
+  toolcall_penalty_weight=2.0, # -0.01,     # penalty when negative
   legalgenius_path=os.getenv("LEGALGENIUS_PATH", "/disk/legalgenius"),
   judge_base_url=os.getenv("JUDGE_BASE_URL", "https://api.openai.com/v1"),
   judge_api_key=os.getenv("JUDGE_API_KEY", os.getenv("OPENAI_API_KEY")),
@@ -114,7 +114,7 @@ vllm_api_key = os.getenv("VLLM_API_KEY", "EMPTY")  # vLLM often ignores auth; ke
 policy_client = AsyncOpenAI(base_url=vllm_base_url, api_key=vllm_api_key)
 
 #model_name = "ServiceNow-AI/Apriel-1.5-15b-Thinker"
-model_name = "willcb/Qwen3-8B"
+model_name = "willcb/Qwen3-14B"
 #model_name = "Qwen/Qwen3-8B"
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 model_kwargs = {
@@ -137,18 +137,21 @@ model, tok = get_model_and_tokenizer(model_name, use_liger=use_liger, model_kwar
 
 model.to(device)
 
+
+
+
 # Training config
 args = GRPOConfig(
   output_dir="outputs/legal-mcp-grpo",
   run_name="legal-mcp-grpo",
-  learning_rate=1e-6,
+  learning_rate=2e-6,
   lr_scheduler_type="constant_with_warmup",
   warmup_steps=10,
   max_steps=500,
   bf16=(device.type == "cuda"),
   fp16=False,
   no_cuda=(device.type != "cuda"),
-  max_grad_norm=0.01,
+  max_grad_norm=1.0,   # 0.01
   num_iterations=1,
   # Use a smaller context window by default to reduce VRAM
   max_prompt_length=1024,  # test because default=512
@@ -165,45 +168,26 @@ args = GRPOConfig(
   log_on_each_node=False,
   log_completions=True,
   report_to=[],
+  beta=0.05
 )
-args.max_tokens = 4096
+
 args.logging_strategy = "steps"
 args.disable_tqdm = False
 args.vllm_server_host = "127.0.0.1"
 args.logging_first_step = True
 args.report_to = "wandb"
 
-# Optional environment overrides for quick tuning
-_max_steps = os.getenv("MAX_STEPS")
-if _max_steps:
-  try:
-    args.max_steps = int(_max_steps)
-  except Exception:
-    pass
-_pbs = os.getenv("PER_DEVICE_TRAIN_BATCH_SIZE")
-if _pbs:
-  try:
-    args.per_device_train_batch_size = int(_pbs)
-  except Exception:
-    pass
-_ng = os.getenv("NUM_GENERATIONS")
-if _ng:
-  try:
-    args.num_generations = int(_ng)
-  except Exception:
-    pass
+model.train()
+model.config.use_cache = False
+if args.gradient_checkpointing:
+    model.gradient_checkpointing_enable()
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
 
-# Optional: Override max sequence length via env for quick VRAM tuning
-_msl = os.getenv("MAX_SEQ_LEN")
-if _msl:
-  try:
-    args.max_seq_len = int(_msl)
-  except Exception:
-    pass
 
 # Enable LoRA/PEFT to reduce trainable parameters and VRAM usage
-_lora_r = int(os.getenv("LORA_R", "16"))
-_lora_alpha = int(os.getenv("LORA_ALPHA", "64"))
+_lora_r = int(os.getenv("LORA_R", "8"))
+_lora_alpha = int(os.getenv("LORA_ALPHA", "16"))
 
 peft_cfg = lora_defaults(r=_lora_r, alpha=_lora_alpha)
 
@@ -216,6 +200,14 @@ trainer = GRPOTrainer(
   args=args,
   peft_config=peft_cfg,
 )
+
+n_all  = sum(p.numel() for p in model.parameters())
+n_grad = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"Trainable params: {n_grad}/{n_all}")
+assert n_grad > 0, "No trainable parameters – check LoRA/PEFT config"
+
+
+
 trainer.train()
 print ("DONE")
 

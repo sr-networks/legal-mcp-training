@@ -13,11 +13,13 @@ class ToolEnv(MultiTurnEnv):
         tools: list[Callable] | None = None,
         max_turns: int = 10,
         error_formatter: Callable[[Exception], str] = lambda e: f"{str(e)}",
+        max_parallel_tool_calls: int | None = None,
         **kwargs,
     ):
         self.tools = tools or []
         self.max_turns = max_turns
         self.error_formatter = error_formatter
+        self.max_parallel_tool_calls = max_parallel_tool_calls
         self.oai_tools = [convert_func_to_oai_tool(tool) for tool in self.tools]
         self.tool_map = {tool.__name__: tool for tool in self.tools}
         super().__init__(oai_tools=self.oai_tools, max_turns=max_turns, **kwargs)
@@ -57,7 +59,16 @@ class ToolEnv(MultiTurnEnv):
         assert isinstance(messages, list)
         assert "tool_calls" in messages[-1]
         tool_messages = []
-        for tool_call in messages[-1]["tool_calls"]:
+        tool_calls = messages[-1]["tool_calls"] or []
+        allowed_calls = tool_calls
+        blocked_calls: list[ChatCompletionMessageToolCall] = []
+        if (
+            self.max_parallel_tool_calls is not None
+            and len(tool_calls) > self.max_parallel_tool_calls
+        ):
+            allowed_calls = tool_calls[: self.max_parallel_tool_calls]
+            blocked_calls = tool_calls[self.max_parallel_tool_calls :]
+        for tool_call in allowed_calls:
             assert isinstance(tool_call, ChatCompletionMessageToolCall)
             tool_name: str = tool_call.function.name
             tool_args: dict = json.loads(tool_call.function.arguments)
@@ -66,4 +77,16 @@ class ToolEnv(MultiTurnEnv):
                 tool_name, tool_args, tool_call_id
             )
             tool_messages.append(tool_message)
+        for blocked_call in blocked_calls:
+            tool_call_id: str = blocked_call.id or ""
+            error = RuntimeError(
+                f"Too many parallel tool calls: maximum is {self.max_parallel_tool_calls}"
+            )
+            tool_messages.append(
+                {
+                    "role": "tool",
+                    "content": self.error_formatter(error),
+                    "tool_call_id": tool_call_id,
+                }
+            )
         return tool_messages, state

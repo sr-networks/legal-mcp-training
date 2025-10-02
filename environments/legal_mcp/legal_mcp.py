@@ -10,7 +10,7 @@ from typing import Any, Callable, Optional
 import verifiers as vf
 from datasets import Dataset
 
-
+max_tool_response_length =4000
 _MCP = None
 _DISPATCH = None
 
@@ -101,7 +101,7 @@ def elasticsearch_search(query: str, document_type: str = "all", max_results: in
         context_lines=context_lines,
     )
     if isinstance(res, str):
-        return res
+        return res[:max_tool_response_length]
     try:
         return json.dumps(res, ensure_ascii=False)
     except TypeError:
@@ -236,7 +236,8 @@ def load_environment(
     judge_model: str = "gpt-4.1-nano",
     token_penalty_weight: float = 0.0, # -0.000005,
     toolcall_penalty_weight: float = 1.0, # -0.01,
-    max_turns: int = 8,
+    max_turns: int = 10,
+    max_parallel_tool_calls: int | None = 2,
     judge_base_url: Optional[str] = None,
     judge_api_key: Optional[str] = None,
     legalgenius_path: Optional[str] = None,
@@ -253,6 +254,7 @@ def load_environment(
         token_penalty_weight: Negative weight applied to total tokens over rollout.
         toolcall_penalty_weight: Negative weight applied to number of tool calls.
         max_turns: Max assistant-tool turns for ToolEnv.
+        max_parallel_tool_calls: Maximum tool calls accepted per assistant message (None for unlimited).
         legalgenius_path: Path to the legalgenius project root (defaults env LEGALGENIUS_PATH or '/home/sten/legalgenius').
         mcp_server_cmd: Optional explicit command to launch the MCP server.
         cfg: Optional config dict propagated to the MCP environment (e.g., legal_doc_root).
@@ -278,14 +280,16 @@ def load_environment(
         rubric=rubric,
         tools=tools,
         max_turns=max_turns,
+        max_parallel_tool_calls=max_parallel_tool_calls,
         parser=parser,
 system_prompt = """\
-Sie sind ein juristischer Experte für deutsches Recht.
+Sie sind ein juristischer Experte für deutsches Recht. Analysieren Sie die folgende Frage oder den folgenden Fall \
+und geben eine vollständige Beantwortung mit Hilfe der durch tools zur Verfügung gestellten Rechtsquellen zurück.
 
 ARBEITSSTIL
 - Denken Sie Schritt-für-Schritt und geben Sie Ihr Reasoning in <think>...</think> aus.
 - Antworten Sie ausschließlich auf Deutsch, präzise und belegt.
-- Verwenden Sie KEIN internes/implizites Wissen für materielle Aussagen; recherchieren und belegen Sie alles mit Werkzeugen.
+- Verwenden Sie KEIN internes/implizites Wissen für materielle Aussagen; recherchieren und belegen Sie alles mit tool calls.
 
 WERKZEUG-PFLICHT & ITERATION
 - Nutzen Sie die verfügbaren Tools **verpflichtend** und **mehrfach**.
