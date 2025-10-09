@@ -14,7 +14,6 @@ max_tool_response_length =4000
 _MCP = None
 _DISPATCH = None
 
-
 def _load_legalgenius_module(legalgenius_path: str) -> Any:
     """Dynamically import legalgenius/client/agent_cli.py and return the module.
 
@@ -160,30 +159,33 @@ async def token_penalty(completion: list[dict], state: dict | None = None, **_kw
 
 
 async def tool_call_penalty(completion: list[dict], **_kwargs) -> float:
-    count = 0
+    """Count only executed tool calls (unique tool_call_id); exclude blocked synthetic messages."""
+    executed_ids: set[str] = set()
     for m in completion:
-        if m.get("role") == "assistant" and m.get("tool_calls"):
-            try:
-                count += len(m["tool_calls"])  # type: ignore[arg-type]
-            except Exception:
-                pass
-    return float(count)
+        if m.get("role") == "tool":
+            if m.get("is_blocked_tool_call"):
+                continue
+            content = str(m.get("content", ""))
+            if content.startswith("Too many parallel tool calls:"):
+                continue
+            tcid = m.get("tool_call_id")
+            if isinstance(tcid, str) and tcid:
+                executed_ids.add(tcid)
+    return float(len(executed_ids))
 
 
 def _make_rubric(judge_model: str, token_penalty_weight: float, toolcall_penalty_weight: float, judge_api_key: Optional[str] = None, judge_base_url: Optional[str] = None) -> vf.Rubric:
     from openai import AsyncOpenAI
     judge_client = AsyncOpenAI(api_key=judge_api_key or os.getenv("OPENAI_API_KEY", "dummy"), base_url=judge_base_url or os.getenv("JUDGE_BASE_URL", None))
-    legal_judge_prompt="""Gegeben sei eine ground truth Antwort \
-und eine Antwort zu einer komplexen juristischen Frage. \
-Bewerte auf einer Skala von 1.0 (vollständig falsch) bis 10.0 (vollständig korrekt), \
-wie gut die Antwort die juristische Argumentation und Schlußfolgerung der ground truth Antwort wiedergibt. 
+    legal_judge_prompt="""Du bist ein juristischer Experte und sollst die Antwort auf eine juristische Recherche-Arbeit bewerten und mit der Goldantwort vergleichen. \
+    Schätze die Korrektheit der Antwort auf einer Skala von 1 bis 10 ein. Bewerte nur die juristische Korrektheit und nicht die Form der Antwort.
 
 Frage:
 ```
 {question}
 ```
 
-Ground truth Anwort:
+Goldantwort:
 ```
 {answer}
 ```
@@ -200,7 +202,7 @@ Gib ausschließlich eine einzelne Fließkommazahl im Bereich 1.0 bis 10.0 zurüc
             judge_client=judge_client, 
             judge_model=judge_model, 
             judge_prompt=legal_judge_prompt, 
-            judge_sampling_args={ "max_tokens": 4096 }, )
+            judge_sampling_args={ "max_tokens": 8192 }, )
     async def judge_accuracy_reward(judge, prompt, completion, answer, state, **kwargs) -> float:
         judge_response = await judge(prompt, completion, answer, state, **kwargs)
         print ("JUDGE:",judge_response)
@@ -235,7 +237,7 @@ def load_environment(
     data: Optional[list[dict[str, Any]]] = None,
     judge_model: str = "gpt-4.1-nano",
     token_penalty_weight: float = 0.0, # -0.000005,
-    toolcall_penalty_weight: float = 1.0, # -0.01,
+    toolcall_penalty_weight: float = 0.0, # -0.01,
     max_turns: int = 10,
     max_parallel_tool_calls: int | None = 2,
     judge_base_url: Optional[str] = None,
@@ -244,6 +246,7 @@ def load_environment(
     mcp_server_cmd: Optional[list[str]] = None,
     cfg: Optional[dict] = None,
     enable_tools: bool = True,
+    parallel_tool_calls=False
 ) -> vf.ToolEnv:
     """Load the Legal MCP ToolEnv environment.
 
@@ -275,58 +278,18 @@ def load_environment(
     rubric = _make_rubric(judge_model, token_penalty_weight, toolcall_penalty_weight, judge_api_key=judge_api_key, judge_base_url=judge_base_url)
     tools = [read_file_range, elasticsearch_search ] if enable_tools else []
     parser = vf.ThinkParser()
+ 
+
     env = vf.ToolEnv(
         dataset=ds,
         rubric=rubric,
         tools=tools,
         max_turns=max_turns,
         max_parallel_tool_calls=max_parallel_tool_calls,
-        parser=parser,
-system_prompt = """\
-Sie sind ein juristischer Experte für deutsches Recht. Analysieren Sie die folgende Frage oder den folgenden Fall \
-und geben eine vollständige Beantwortung mit Hilfe der durch tools zur Verfügung gestellten Rechtsquellen zurück.
-
-ARBEITSSTIL
-- Denken Sie Schritt-für-Schritt und geben Sie Ihr Reasoning in <think>...</think> aus.
-- Antworten Sie ausschließlich auf Deutsch, präzise und belegt.
-- Verwenden Sie KEIN internes/implizites Wissen für materielle Aussagen; recherchieren und belegen Sie alles mit tool calls.
-
-WERKZEUG-PFLICHT & ITERATION
-- Nutzen Sie die verfügbaren Tools **verpflichtend** und **mehrfach**.
-- Führen Sie so lange weitere Tool-Aufrufe aus, bis der Sach- und Rechts­hintergrund ausreichend geklärt ist, insbesondere:
-  - alle relevanten Normen (Gesetze/Verordnungen) in aktueller Fassung identifiziert,
-  - einschlägige Rechtsprechung (Leitentscheidungen, OLG/LSG/BSG/BGH/BVerfG etc.) gefunden,
-  - Tatbestandsmerkmale und Rechtsfolgen vollständig subsumiert,
-  - Unklarheiten (Sachverhalt, Zuständigkeit, Fristen, Ausnahmen) entweder durch Quellen geklärt oder als offene Punkte markiert.
-
-RECHERCHE-STRATEGIE
-- Beginnen Sie mit 2–4 variierenden Suchanfragen (Synonyme, Abkürzungen, §-Zitate).
-- Wenn Ergebnisse der Elasticsearch-Suche vorliegen: Überlegen Sie, welches Ergebnis (path + line number + text) zur Frage passt.
-- Öffnen Sie dann passende Treffer per line number mit dem Tool `read_file_range`, um den Kontext (+- n Zeilen um die line number) zu prüfen.
-- Bei Bedarf wiederholen Sie das elasticsearch bzw read_file_range Tool.
-
-Verfügbare Werkzeuge (Function/Tool Calling):
-1) elasticsearch_search
-   Argumente: { query: string, document_type: 'all'|'gesetze'|'urteile', max_results: number, context_lines: number }
-   Rückgabe: { total_hits: number,
-               matches: [{ title, document_type, file_path, score,
-                            content_preview: [{"line_number": absolute line, "snippet": mehrzeiliger Kontext}],
-                            line_matches: ... }]
-   Zweck: Schnelle Volltextsuche im Rechtskorpus mit Relevanz-Ranking.
-
-2) read_file_range (MUST RUN)
-   Argumente: { path: file_path string, line_number: line number from elasticsearch_search, context_lines: number }
-   Rückgabe: { text: string }
-   Zweck: Präzise Kontextpassagen (z. B. §-Überschriften, Leitsätze, Randnummern) zum Zitieren.
-
-AUSFÜHRUNG
-- Denken Sie zuerst (<think>), dann rufen Sie die Tools in mehreren Schritten auf, bis die Prüfkriterien erfüllt sind.
-- Wiederholen Sie mindestens drei Zyklen von <think> und tool use inkl. real_file_range.
-- Geben Sie erst dann eine strukturierte Endantwort in Deutsch aus.
-""" 
+        parser=parser)
 #3) file_search
 #   Argumente: { query: string (mit AND/OR/Klammern), glob?: string, max_results?: number }
 #   Rückgabe: { files: string[] }
 #   Zweck: Dateinamen-/Pfad-basierte Eingrenzung.
- )
+ 
     return env

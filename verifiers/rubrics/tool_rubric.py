@@ -26,36 +26,70 @@ class ToolRubric(Rubric):
         super().__init__(funcs=reward_funcs, weights=reward_weights)
 
     async def total_tool_calls(self, completion: Messages) -> float:
-        """Count the total number of tool calls across all assistant messages."""
-        total = 0
+        """Count only executed tool calls by matching tool_results to tool_call_id.
+
+        Strategy:
+        - Find all non-blocked tool result messages and collect their `tool_call_id`.
+        - Count unique IDs as executed tool calls.
+        This avoids counting assistant-declared calls that were blocked.
+        """
         assert isinstance(completion, list)
+        executed_ids: set[str] = set()
         for msg in completion:
-            if msg.get("role") == "assistant" and "tool_calls" in msg:
-                tool_calls = msg.get("tool_calls", [])
-                if isinstance(tool_calls, list):
-                    total += len(tool_calls)
-        return float(total)
+            if msg.get("role") != "tool":
+                continue
+            if msg.get("is_blocked_tool_call"):
+                continue
+            content = str(msg.get("content", ""))
+            if content.startswith("Too many parallel tool calls:"):
+                continue
+            tcid = msg.get("tool_call_id")
+            if isinstance(tcid, str) and tcid:
+                executed_ids.add(tcid)
+        return float(len(executed_ids))
 
     def get_tool_call_count_func(self, tool_name: str) -> Callable:
         """Create a reward function that counts calls to a specific tool."""
 
         async def tool_call_count_func(completion: Messages) -> float:
-            """Count calls to {tool_name} tool."""
+            """Count executed calls to a specific tool (matches by tool_call_id)."""
             count = 0
-
-            # Find tool calls in assistant messages
             assert isinstance(completion, list)
+
+            # Build mapping from tool_call_id -> tool_name from assistant messages
+            id_to_name: dict[str, str] = {}
             for msg in completion:
                 if msg.get("role") == "assistant" and "tool_calls" in msg:
                     tool_calls = msg.get("tool_calls", [])
                     if not isinstance(tool_calls, list):
                         continue
+                    for tc in tool_calls:
+                        try:
+                            tc_id = getattr(tc, "id", None) or (hasattr(tc, "model_dump") and tc.model_dump().get("id"))
+                            func = getattr(tc, "function", None)
+                            func_name = getattr(func, "name", None)
+                            if isinstance(tc_id, str) and isinstance(func_name, str):
+                                id_to_name[tc_id] = func_name
+                        except Exception:
+                            continue
 
-                    for tool_call in tool_calls:
-                        if hasattr(tool_call, "function"):
-                            assert hasattr(getattr(tool_call, "function"), "name")
-                            if getattr(tool_call, "function").name == tool_name:
-                                count += 1
+            # Count only tool results that correspond to this tool and are not blocked
+            executed_ids: set[str] = set()
+            for msg in completion:
+                if msg.get("role") != "tool":
+                    continue
+                if msg.get("is_blocked_tool_call"):
+                    continue
+                content = str(msg.get("content", ""))
+                if content.startswith("Too many parallel tool calls:"):
+                    continue
+                tcid = msg.get("tool_call_id")
+                if isinstance(tcid, str) and tcid:
+                    executed_ids.add(tcid)
+
+            for tcid in executed_ids:
+                if id_to_name.get(tcid) == tool_name:
+                    count += 1
 
             return float(count)
 

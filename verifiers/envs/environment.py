@@ -257,6 +257,7 @@ class Environment(ABC):
                         messages=prompt,  # type: ignore
                         **clean_sampling_args,
                     )
+                print ("\n\nROLLOUT PROMPT",prompt,"\n")    
                 return response
             elif message_type == "completion":
                 if oai_tools:

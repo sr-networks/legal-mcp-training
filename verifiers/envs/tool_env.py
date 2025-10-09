@@ -87,6 +87,8 @@ class ToolEnv(MultiTurnEnv):
                     "role": "tool",
                     "content": self.error_formatter(error),
                     "tool_call_id": tool_call_id,
+                    # Mark as blocked so rubrics/costs can ignore it
+                    "is_blocked_tool_call": True,
                 }
             )
         return tool_messages, state

@@ -1322,22 +1322,34 @@ class GRPOTrainer(Trainer):
     ) -> list[dict[str, Any]] | str:
         if isinstance(completion, str):
             return completion
-        for msg in completion:
+        # Work on a shallow copy to avoid mutating original logs
+        sanitized = [dict(msg) for msg in completion]
+        for msg in sanitized:
             if "tool_calls" in msg:
-                tool_calls = []
-                msg["tool_calls"] = []
-                for tc in msg["tool_calls"]:
-                    tool_calls.append(
+                orig_tool_calls = msg.get("tool_calls", [])
+                tool_calls_serialized = []
+                for tc in orig_tool_calls:
+                    try:
+                        func = tc.get("function", {}) if isinstance(tc, dict) else {}
+                    except Exception:
+                        func = {}
+                    tool_calls_serialized.append(
                         {
-                            "name": tc.get("function", {}).get("name", ""),
-                            "args": tc.get("function", {}).get("arguments", {}),
+                            "name": (func.get("name") if isinstance(func, dict) else ""),
+                            "args": (func.get("arguments") if isinstance(func, dict) else {}),
                         }
                     )
-                msg["content"] += str({"tool_calls": tool_calls})
+                content = msg.get("content", "")
+                if not isinstance(content, str):
+                    try:
+                        content = json.dumps(content, ensure_ascii=False)
+                    except Exception:
+                        content = str(content)
+                msg["content"] = content + str({"tool_calls": tool_calls_serialized})
                 msg.pop("tool_calls")
             if "tool_call_id" in msg:
                 msg.pop("tool_call_id")
-        return completion
+        return sanitized
 
     @staticmethod
     def _flatten_message_content(content: Any) -> str:
@@ -1616,9 +1628,9 @@ class GRPOTrainer(Trainer):
 
                 table_data = {
                     "step": [str(self.state.global_step)] * len(prompts),
-                    "prompt": prompts,
+                    "prompt": [self._flatten_conversation(p) for p in prompts],
                     "completion": [
-                        self._sanitize_tool_calls(c)  # type: ignore
+                        self._flatten_conversation(c)  # type: ignore
                         for c in completions
                     ],
                     "gold_answer": [
@@ -1706,9 +1718,12 @@ class GRPOTrainer(Trainer):
                 table = {
                     "step": [str(self.state.global_step)]
                     * len(self._textual_logs["prompt"]),
-                    "prompt": list(self._textual_logs["prompt"]),
+                    "prompt": [
+                        self._flatten_conversation(p)
+                        for p in self._textual_logs["prompt"]
+                    ],
                     "completion": [
-                        self._sanitize_tool_calls(c)
+                        self._flatten_conversation(c)
                         for c in self._textual_logs["completion"]
                     ],
                     "gold_answer": [
