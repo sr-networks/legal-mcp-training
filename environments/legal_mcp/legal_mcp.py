@@ -10,7 +10,7 @@ from typing import Any, Callable, Optional
 import verifiers as vf
 from datasets import Dataset
 
-max_tool_response_length =4000
+max_tool_response_length =1500
 _MCP = None
 _DISPATCH = None
 
@@ -238,8 +238,8 @@ def load_environment(
     judge_model: str = "gpt-4.1-nano",
     token_penalty_weight: float = 0.0, # -0.000005,
     toolcall_penalty_weight: float = 0.0, # -0.01,
-    max_turns: int = 10,
-    max_parallel_tool_calls: int | None = 2,
+    max_turns: int = 6,
+    max_parallel_tool_calls: int | None = 1,
     judge_base_url: Optional[str] = None,
     judge_api_key: Optional[str] = None,
     legalgenius_path: Optional[str] = None,

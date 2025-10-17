@@ -19,6 +19,24 @@ from transformers import AutoTokenizer, AutoModelForImageTextToText
 from legal_mcp import load_environment
 from verifiers import GRPOTrainer, get_model_and_tokenizer, lora_defaults
 from verifiers.trainers import GRPOConfig
+from peft import LoraConfig
+
+_original_flatten_conversation = GRPOTrainer._flatten_conversation
+
+
+def _flatten_conversation_without_system(messages):
+  if isinstance(messages, (list, tuple)):
+    filtered = []
+    for msg in messages:
+      if isinstance(msg, dict) and msg.get("role") == "system":
+        continue
+      filtered.append(msg)
+    return _original_flatten_conversation(filtered)
+  return _original_flatten_conversation(messages)
+
+
+# Strip system-only scaffolding from WandB prompt logs so the field reflects user input.
+GRPOTrainer._flatten_conversation = staticmethod(_flatten_conversation_without_system)
 
 system_prompt = """
 Sie sind ein juristischer Experte für deutsches Recht. Analysieren Sie die folgende Frage oder den folgenden Fall \
@@ -38,7 +56,8 @@ WERKZEUG-PFLICHT & ITERATION
   - Unklarheiten (Sachverhalt, Zuständigkeit, Fristen, Ausnahmen) entweder durch Quellen geklärt oder als offene Punkte markiert.
 
 RECHERCHE-STRATEGIE
-- Beginnen Sie mit 2–4 variierenden Suchanfragen (Synonyme, Abkürzungen, §-Zitate).
+- Beginnen Sie mit variierenden Suchanfragen (Synonyme, Abkürzungen, §-Zitate).
+- Rufen Sie pro Schritt nur ein Tool auf.
 - Wenn Ergebnisse der Elasticsearch-Suche vorliegen: Überlegen Sie, welches Ergebnis (path + line number + text) zur Frage passt.
 - Öffnen Sie dann passende Treffer per line number mit dem Tool `read_file_range`, um den Kontext (+- n Zeilen um die line number) zu prüfen.
 - Bei Bedarf wiederholen Sie das elasticsearch bzw read_file_range Tool.
@@ -52,14 +71,13 @@ Verfügbare Werkzeuge (Function/Tool Calling):
                             line_matches: ... }]
    Zweck: Schnelle Volltextsuche im Rechtskorpus mit Relevanz-Ranking.
 
-2) read_file_range (MUST RUN)
+2) read_file_range
    Argumente: { path: file_path string, line_number: line number from elasticsearch_search, context_lines: number }
    Rückgabe: { text: string }
    Zweck: Präzise Kontextpassagen (z. B. §-Überschriften, Leitsätze, Randnummern) zum Zitieren.
 
 AUSFÜHRUNG
 - Denken Sie zuerst (<think>), dann rufen Sie die Tools in mehreren Schritten auf, bis die Prüfkriterien erfüllt sind.
-- Wiederholen Sie mindestens drei Zyklen von <think> und tool use inkl. real_file_range.
 - Geben Sie erst dann eine strukturierte Endantwort in Deutsch aus.
 """
 
@@ -153,7 +171,7 @@ logging.getLogger("AsyncBatchGenerator").addHandler(logging.StreamHandler())
 vf_env = load_environment(
   dataset=ds,
   judge_model=os.getenv("JUDGE_MODEL", "gpt-5-nano-2025-08-07" ), #"gpt-5-nano-2025-08-07"  gpt-4.1-nano-2025-04-14
-  token_penalty_weight=0.0, #-0.000005,    # penalty when negative
+  token_penalty_weight=-0.000005,    # penalty when negative
   toolcall_penalty_weight=0.0, # -0.01,     # penalty when negative
   legalgenius_path=os.getenv("LEGALGENIUS_PATH", "/disk/legalgenius"),
   judge_base_url=os.getenv("JUDGE_BASE_URL", "https://api.openai.com/v1"),
@@ -182,11 +200,11 @@ model_kwargs = {
   "attn_implementation": attn_impl,
   "use_cache": False,
     # >>> Add YaRN to match vLLM <<<
-  "rope_scaling": {
-    "type": "yarn",                           # same as vLLM's rope_type
-    "factor": 4.0,                            # same factor
-    "original_max_position_embeddings": 32768 # same as your vLLM flag
-  }
+#  "rope_scaling": {
+#    "type": "yarn",                           # same as vLLM's rope_type
+#    "factor": 4.0,                            # same factor
+#    "original_max_position_embeddings": 32768 # same as your vLLM flag
+#  }
 }
 if device.type == "cpu":
   logging.warning("CUDA not available; using CPU for model execution.")
@@ -194,12 +212,6 @@ if device.type == "cpu":
 # require a GPU driver and will fail. This keeps CPU execution working.
 use_liger = (device.type == "cuda")
 model, tok = get_model_and_tokenizer(model_name, use_liger=use_liger, model_kwargs=model_kwargs)
-#model = AutoModelForImageTextToText.from_pretrained(
-#    model_name, 
-#    torch_dtype=torch.bfloat16, 
-#    device_map="auto"
-#)
-#tok = AutoTokenizer.from_pretrained(model_name)
 
 if tok.pad_token is None:
     tok.pad_token = tok.eos_token
@@ -211,41 +223,41 @@ tok.model_max_length = max(tok.model_max_length, 131072)  # match YaRN context
 model.to(device)
 
 #sanity checks
-assert getattr(model.config, "rope_scaling", None), "YaRN not applied locally"
-rs = model.config.rope_scaling
-assert rs.get("type") == "yarn" and float(rs.get("factor")) == 4.0 \
-       and int(rs.get("original_max_position_embeddings")) == 32768
+#assert getattr(model.config, "rope_scaling", None), "YaRN not applied locally"
+#rs = model.config.rope_scaling
+#assert rs.get("type") == "yarn" and float(rs.get("factor")) == 4.0 \
+#       and int(rs.get("original_max_position_embeddings")) == 32768
 
 
 # Training config
 args = GRPOConfig(
   output_dir="outputs/legal-mcp-grpo",
   run_name="legal-mcp-grpo",
-  learning_rate=5e-6,
+  learning_rate=1e-5,
   lr_scheduler_type="constant_with_warmup",
   warmup_steps=10,
-  max_steps=500,
+  max_steps=200,
   bf16=(device.type == "cuda"),
   fp16=False,
   no_cuda=(device.type != "cuda"),
-  max_grad_norm=1.0,   # 0.01
   num_iterations=1,
   # Use a smaller context window by default to reduce VRAM
-  max_prompt_length=4096,  # test because default=512
-  max_seq_len=16348,    # prompt + multiple completions incl thoughts, tool results
-  max_tokens=16348,  # multiple thoughts and final results
+  max_prompt_length=3000,  # test because default=512
+  max_seq_len=20000,    # (verifiers) Model's context window 131072, prompt + multiple completions incl thoughts, tool results
+  max_tokens=1500,  # (verifiers) Max tokens per (turn-level) response 
   per_device_train_batch_size=1,
-  num_generations=8,
-  gradient_accumulation_steps=8,
+  num_generations=4,
+  gradient_accumulation_steps=32,
   gradient_checkpointing=True,
   save_strategy="steps",
-  save_steps=5,
+  save_steps=30,
   save_only_model=True,
   logging_steps=1,
   log_on_each_node=False,
   log_completions=True,
   report_to=[],
-  beta=0.02
+  beta=0.0,
+  max_grad_norm=0.5,
 )
 
 args.logging_strategy = "steps"
@@ -253,6 +265,7 @@ args.disable_tqdm = False
 args.vllm_server_host = "127.0.0.1"
 args.logging_first_step = True
 args.report_to = "wandb"
+args.mask_truncated_completions = True  # quick truncation flag
 
 model.train()
 model.config.use_cache = False
@@ -263,10 +276,21 @@ if args.gradient_checkpointing:
 
 
 # Enable LoRA/PEFT to reduce trainable parameters and VRAM usage
-_lora_r = int(os.getenv("LORA_R", "8"))
-_lora_alpha = int(os.getenv("LORA_ALPHA", "32"))
+_lora_r = int(os.getenv("LORA_R", "1"))
+_lora_alpha = int(os.getenv("LORA_ALPHA", "16"))
 
-peft_cfg = lora_defaults(r=_lora_r, alpha=_lora_alpha)
+#peft_cfg = lora_defaults(r=_lora_r, alpha=_lora_alpha,)
+
+mlp_only_targets = ["gate_proj", "up_proj", "down_proj"]  # adjust to your model’s naming
+
+peft_cfg = LoraConfig(
+    r=_lora_r,
+    lora_alpha=_lora_alpha,
+    target_modules=mlp_only_targets,
+    task_type="CAUSAL_LM",
+    lora_dropout=0.0,        # keep whatever settings you need
+    bias="none",
+)
 
 
 print ("RUNNING")
