@@ -499,6 +499,9 @@ class GRPOTrainer(Trainer):
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         self._total_train_tokens = 0
         self.log_completions = args.log_completions
+        self.log_eval_completions_only = getattr(
+            args, "log_eval_completions_only", False
+        )
         self.wandb_log_unique_prompts = args.wandb_log_unique_prompts
         self.num_completions_to_print = args.num_completions_to_print
 
@@ -865,7 +868,8 @@ class GRPOTrainer(Trainer):
                 "top_k": self.top_k,
                 "min_p": self.min_p,
                 "repetition_penalty": self.repetition_penalty,
-                "skip_special_tokens": False,
+                # Mistral tokenizers in vLLM reject skip_special_tokens=False.
+                "skip_special_tokens": True,
                 "spaces_between_special_tokens": False,
                 "include_stop_str_in_output": False,
                 "return_tokens_as_token_ids": True,
@@ -1461,6 +1465,15 @@ class GRPOTrainer(Trainer):
                     thoughts.append(cleaned)
         return "\n\n".join(thoughts)
 
+    def _should_log_completions(self, is_eval: bool) -> bool:
+        if not self.accelerator.is_main_process:
+            return False
+        if not self.log_completions:
+            return False
+        if self.log_eval_completions_only and not is_eval:
+            return False
+        return True
+
     def evaluate(
         self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval", **kwargs
     ):
@@ -1573,7 +1586,7 @@ class GRPOTrainer(Trainer):
             metrics["eval_tokens/max_completion"] = float(np.max(completion_totals))
 
         # Log sample completions if requested
-        if self.accelerator.is_main_process and self.log_completions:
+        if self._should_log_completions(is_eval=True):
             # Prepare textual logs
             prompts = eval_results.prompt[: self.num_completions_to_print]
             completions = eval_results.completion[: self.num_completions_to_print]
@@ -1586,6 +1599,11 @@ class GRPOTrainer(Trainer):
                 reward_dict[key] = eval_results.metrics[key][
                     : self.num_completions_to_print
                 ]
+
+            tool_outputs_samples = [
+                self._extract_tool_outputs(completion)
+                for completion in completions
+            ]
 
             # Print sample
             print_prompt_completions_sample(
@@ -1699,7 +1717,7 @@ class GRPOTrainer(Trainer):
             super().log(logs)
         self._metrics[mode].clear()
 
-        if self.accelerator.is_main_process and self.log_completions:
+        if self._should_log_completions(mode == "eval"):
             if len(self._textual_logs["prompt"]) > 0:
                 print_prompt_completions_sample(
                     self._textual_logs["prompt"],

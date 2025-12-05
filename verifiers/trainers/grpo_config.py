@@ -322,6 +322,13 @@ class GRPOConfig(TrainingArguments):
             "installed, it prints the sample. If `wandb` logging is enabled, it logs it to `wandb`."
         },
     )
+    log_eval_completions_only: bool = field(
+        default=False,
+        metadata={
+            "help": "If `True`, completion samples are only logged during evaluation runs. Training logs keep scalar "
+            "metrics but skip prompt/completion tables."
+        },
+    )
     num_completions_to_print: Optional[int] = field(
         default=None,
         metadata={

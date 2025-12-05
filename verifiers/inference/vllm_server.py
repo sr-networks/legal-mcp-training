@@ -1,6 +1,7 @@
 import asyncio
 import os
 import signal
+import traceback
 from argparse import Namespace
 from typing import Sequence
 
@@ -41,9 +42,11 @@ try:
         validate_parsed_serve_args,
     )
     from vllm.usage.usage_lib import UsageContext  # type: ignore
-    from vllm.utils import FlexibleArgumentParser, set_ulimit  # type: ignore
+    from vllm.utils.argparse_utils import FlexibleArgumentParser  # type: ignore
+    from vllm.utils.system_utils import set_ulimit  # type: ignore
 except ImportError:
     print("vLLM is not installed. Please install it with `pip install vllm`.")
+    traceback.print_exc()
     exit(1)
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -229,8 +232,9 @@ async def run_server(args: Namespace):
         await engine.collective_rpc("close_communicator")
         return {"status": "ok"}
 
-    vllm_config = await engine.get_vllm_config()
-    await init_app_state(engine, vllm_config, app.state, args)
+    # AsyncLLM in vLLM 0.12 exposes the config as an attribute.
+    vllm_config = engine.vllm_config
+    await init_app_state(engine, app.state, args)
     shutdown_task = await serve_http(
         app,
         sock,

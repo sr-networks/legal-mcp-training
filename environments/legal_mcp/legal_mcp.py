@@ -234,11 +234,12 @@ def _to_dataset(data: list[dict[str, Any]] | None) -> Dataset | None:
 
 def load_environment(
     dataset: Optional[Dataset] = None,
+    eval_dataset: Optional[Dataset] = None,
     data: Optional[list[dict[str, Any]]] = None,
     judge_model: str = "gpt-4.1-nano",
     token_penalty_weight: float = 0.0, # -0.000005,
     toolcall_penalty_weight: float = 0.0, # -0.01,
-    max_turns: int = 6,
+    max_turns: int = 4,
     max_parallel_tool_calls: int | None = 1,
     judge_base_url: Optional[str] = None,
     judge_api_key: Optional[str] = None,
@@ -252,6 +253,7 @@ def load_environment(
 
     Args:
         dataset: Optional HF Dataset with 'prompt' (chat messages) and 'answer' per row.
+        eval_dataset: Optional HF Dataset used for evaluation.
         data: Optional in-memory list of dicts (same fields) to build a Dataset.
         judge_model: OpenAI-compatible model for judge scoring.
         token_penalty_weight: Negative weight applied to total tokens over rollout.
@@ -270,7 +272,8 @@ def load_environment(
     _ensure_mcp(lg_path, cfg=cfg or {}, server_cmd=mcp_server_cmd)
 
     ds = dataset or _to_dataset(data)
-    if ds is None:
+    eval_ds = eval_dataset
+    if ds is None and eval_ds is None:
         # Minimal placeholder to satisfy Environment constructor; user should pass real data
         ds = Dataset.from_list([
             {"prompt": [{"role": "user", "content": "Frage: Beispiel"}], "answer": ""}
@@ -282,6 +285,7 @@ def load_environment(
 
     env = vf.ToolEnv(
         dataset=ds,
+        eval_dataset=eval_ds,
         rubric=rubric,
         tools=tools,
         max_turns=max_turns,

@@ -3,7 +3,12 @@ from typing import Any, Callable
 
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore
+from transformers import (  # type: ignore
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoModelForVision2Seq,
+    AutoTokenizer,
+)
 
 
 class _ForwardRedirection:
@@ -74,19 +79,34 @@ def get_model(
     use_liger: bool = True,
     model_kwargs: dict[str, Any] | None = None,
 ) -> Any:
-    if model_kwargs is None:
-        model_kwargs = dict(
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-            use_cache=False,
-        )
+    base_kwargs = dict(
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+        use_cache=False,
+    )
+    model_kwargs = {**base_kwargs, **(model_kwargs or {})}
+    config = AutoConfig.from_pretrained(model_name)
+    # AutoModelForCausalLM does not support some multimodal configs (e.g., mistral3).
+    is_multimodal_causal = config.model_type in {"mistral3"}
+    if is_multimodal_causal:
+        use_liger = False  # Liger kernels are text-only; skip for multimodal models.
+        # Some multimodal models reject text-only kwargs.
+        for key in ("use_cache", "attn_implementation"):
+            model_kwargs.pop(key, None)
+
     if is_liger_available() and use_liger:
         print("Using Liger kernel")
         from liger_kernel.transformers import AutoLigerKernelForCausalLM  # type: ignore
 
-        return AutoLigerKernelForCausalLM.from_pretrained(model_name, **model_kwargs)
-    else:
-        return AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+        try:
+            return AutoLigerKernelForCausalLM.from_pretrained(model_name, **model_kwargs)
+        except KeyError:
+            # Liger has no kernel for this model type; fall back to standard transformers model.
+            print("Liger kernels not available for this model type; falling back to transformers AutoModel.")
+
+    if is_multimodal_causal:
+        return AutoModelForVision2Seq.from_pretrained(model_name, config=config, **model_kwargs)
+    return AutoModelForCausalLM.from_pretrained(model_name, config=config, **model_kwargs)
 
 
 def get_tokenizer(model_name: str) -> Any:
