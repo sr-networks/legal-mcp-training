@@ -86,6 +86,11 @@ def get_model(
     )
     model_kwargs = {**base_kwargs, **(model_kwargs or {})}
     config = AutoConfig.from_pretrained(model_name)
+    if "use_cache" in model_kwargs:
+        # `use_cache` is a config field; avoid passing it into model __init__.
+        if hasattr(config, "use_cache"):
+            config.use_cache = model_kwargs["use_cache"]
+        model_kwargs.pop("use_cache", None)
     # AutoModelForCausalLM does not support some multimodal configs (e.g., mistral3).
     is_multimodal_causal = config.model_type in {"mistral3"}
     if is_multimodal_causal:

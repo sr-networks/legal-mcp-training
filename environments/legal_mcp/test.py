@@ -121,12 +121,17 @@ hf_logging.enable_default_handler()
 hf_logging.enable_explicit_format()
 
 if is_flash_attn_2_available():
-  attn_impl = "flash_attention_2"
+  default_attn_impl = "flash_attention_2"
+  logging.info("FlashAttention2 available; using it by default. Override with ATTN_IMPL if desired.")
 else:
-  attn_impl = "eager"
-  logging.warning(
-    "FlashAttention2 not available; falling back to eager attention. Install `flash-attn` to enable it."
-  )
+  default_attn_impl = "sdpa"
+  logging.warning("FlashAttention2 unavailable; defaulting to sdpa. Set ATTN_IMPL=eager if needed.")
+
+attn_impl = os.getenv("ATTN_IMPL", default_attn_impl)
+if attn_impl == "flash_attention_2" and not is_flash_attn_2_available():
+  logging.warning("ATTN_IMPL=flash_attention_2 requested but flash-attn is unavailable; falling back to sdpa.")
+  attn_impl = "sdpa"
+logging.info("Using attention implementation: %s", attn_impl)
 
 # Build data entries: each row -> {prompt: [{role, content}], answer}
 QUESTION_KEYS = ("question_text", "sachverhalt")
@@ -164,15 +169,35 @@ for path in _discover_csvs():
 
 random.shuffle(data)
 ds = Dataset.from_list(data)
+if len(ds) < 2:
+  raise ValueError("At least two records are required to create train/eval splits.")
+
+try:
+  eval_fraction = float(os.getenv("LEGAL_MCP_EVAL_FRACTION", "0.15"))
+except ValueError:
+  eval_fraction = 0.15
+if not 0 < eval_fraction < 1:
+  logging.warning("Invalid eval fraction %.3f; falling back to 0.15", eval_fraction)
+  eval_fraction = 0.15
+split_seed = int(os.getenv("LEGAL_MCP_SPLIT_SEED", "42"))
+eval_size = max(1, int(len(ds) * eval_fraction))
+if eval_size >= len(ds):
+  eval_size = len(ds) - 1
+
+split = ds.train_test_split(test_size=eval_size, seed=split_seed, shuffle=True)
+train_ds = split["train"]
+eval_ds = split["test"]
+logging.info("Dataset split: %d train / %d eval samples", len(train_ds), len(eval_ds))
 
 logging.getLogger("AsyncBatchGenerator").setLevel(logging.DEBUG)
 logging.getLogger("AsyncBatchGenerator").addHandler(logging.StreamHandler())
 
 vf_env = load_environment(
-  dataset=ds,
+  dataset=train_ds,
+  eval_dataset=eval_ds,
   judge_model=os.getenv("JUDGE_MODEL", "gpt-5-nano-2025-08-07" ), #"gpt-5-nano-2025-08-07"  gpt-4.1-nano-2025-04-14
-  token_penalty_weight=-0.000005,    # penalty when negative
-  toolcall_penalty_weight=0.0, # -0.01,     # penalty when negative
+  token_penalty_weight=0.000005, #-0.000005,    # penalty when negative
+  toolcall_penalty_weight=0.1, # -0.01,     # penalty when negative
   legalgenius_path=os.getenv("LEGALGENIUS_PATH", "/disk/legalgenius"),
   judge_base_url=os.getenv("JUDGE_BASE_URL", "https://api.openai.com/v1"),
   judge_api_key=os.getenv("JUDGE_API_KEY", os.getenv("OPENAI_API_KEY")),
@@ -193,6 +218,8 @@ policy_client = AsyncOpenAI(base_url=vllm_base_url, api_key=vllm_api_key)
 
 #model_name = "ServiceNow-AI/Apriel-1.5-15b-Thinker"
 model_name = "willcb/Qwen3-14B"
+#model_name = "mistralai/Ministral-3-14B-Instruct-2512-BF16"
+#model_name = "/disk/rlenv/verifiers/outputs/legal-mcp-grpo/checkpoint-570"
 #model_name = "Qwen/Qwen3-8B"
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 model_kwargs = {
@@ -212,6 +239,7 @@ if device.type == "cpu":
 # require a GPU driver and will fail. This keeps CPU execution working.
 use_liger = (device.type == "cuda")
 model, tok = get_model_and_tokenizer(model_name, use_liger=use_liger, model_kwargs=model_kwargs)
+#model, tok = get_model_and_tokenizer(model_name, use_liger=False, model_kwargs=model_kwargs)
 
 if tok.pad_token is None:
     tok.pad_token = tok.eos_token
@@ -236,15 +264,15 @@ args = GRPOConfig(
   learning_rate=1e-5,
   lr_scheduler_type="constant_with_warmup",
   warmup_steps=10,
-  max_steps=200,
+  max_steps=2000,
   bf16=(device.type == "cuda"),
   fp16=False,
-  no_cuda=(device.type != "cuda"),
+  #no_cuda=(device.type != "cuda"),
   num_iterations=1,
   # Use a smaller context window by default to reduce VRAM
   max_prompt_length=3000,  # test because default=512
-  max_seq_len=20000,    # (verifiers) Model's context window 131072, prompt + multiple completions incl thoughts, tool results
-  max_tokens=1500,  # (verifiers) Max tokens per (turn-level) response 
+  max_seq_len=17000,    # (verifiers) Model's context window 131072, prompt + multiple completions incl thoughts, tool results
+  max_tokens=2900,  # (verifiers) Max tokens per (turn-level) response 
   per_device_train_batch_size=1,
   num_generations=4,
   gradient_accumulation_steps=32,
@@ -252,9 +280,10 @@ args = GRPOConfig(
   save_strategy="steps",
   save_steps=30,
   save_only_model=True,
-  logging_steps=1,
+  logging_steps=5,
   log_on_each_node=False,
   log_completions=True,
+  log_eval_completions_only=True,
   report_to=[],
   beta=0.0,
   max_grad_norm=0.5,
@@ -266,6 +295,8 @@ args.vllm_server_host = "127.0.0.1"
 args.logging_first_step = True
 args.report_to = "wandb"
 args.mask_truncated_completions = True  # quick truncation flag
+args.eval_strategy = "steps"
+args.eval_steps = 10
 
 model.train()
 model.config.use_cache = False
@@ -308,8 +339,8 @@ print(f"Trainable params: {n_grad}/{n_all}")
 assert n_grad > 0, "No trainable parameters – check LoRA/PEFT config"
 
 
-
-trainer.train()
+trainer.train(resume_from_checkpoint="outputs/legal-mcp-grpo/checkpoint-510/")
+#trainer.train()
 print ("DONE")
 
 async def _preflight():

@@ -10,7 +10,7 @@ from typing import Any, Callable, Optional
 import verifiers as vf
 from datasets import Dataset
 
-max_tool_response_length =1500
+max_tool_response_length =1400
 _MCP = None
 _DISPATCH = None
 
